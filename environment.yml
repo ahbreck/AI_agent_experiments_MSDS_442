@@ -1,0 +1,25 @@
+name: msds_442
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  # Python version
+  - python=3.10
+
+  # Jupyter / notebook support
+  - notebook
+
+  # pip is needed inside conda env for PyPI-only packages
+  - pip
+
+  # pip-installed packages
+  - pip:
+      - openai
+      - langchain
+      - langchain-openai
+      - langgraph
+      - tavily-python
+      - pysqlite3-wheels
+      - python-dotenv
+      - langchain-community
+      - pypdf
