@@ -23,3 +23,8 @@ dependencies:
       - python-dotenv
       - langchain-community
       - pypdf
+      - langchain-text-splitters
+      - beautifulsoup4
+      - langgraph-checkpoint-sqlite
+      - langchain_chroma
+      - langchain-classic
