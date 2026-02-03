@@ -28,3 +28,5 @@ dependencies:
       - langgraph-checkpoint-sqlite
       - langchain_chroma
       - langchain-classic
+      - PyMuPDF
+      - pillow
