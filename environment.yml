@@ -30,3 +30,5 @@ dependencies:
       - langchain-classic
       - PyMuPDF
       - pillow
+      - mermaid_cli
+      - grandalf
