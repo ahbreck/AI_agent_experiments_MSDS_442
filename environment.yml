@@ -32,3 +32,4 @@ dependencies:
       - pillow
       - mermaid_cli
       - grandalf
+      - markdown
