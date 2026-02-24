@@ -45,3 +45,4 @@ dependencies:
       - mermaid_cli
       - grandalf
       - markdown
+      - nbstripout
