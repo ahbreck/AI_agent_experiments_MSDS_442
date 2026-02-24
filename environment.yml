@@ -8,6 +8,18 @@ dependencies:
 
   # Jupyter / notebook support
   - notebook
+  - ipykernel
+  - jupyterlab
+
+  # --- Core Scientific Stack (let conda manage compiled libs) ---
+  - numpy
+  - pandas
+  - matplotlib
+  - seaborn
+  - scipy
+
+  # --- PDF / image stack (conda versions are safer for compiled deps) ---
+  - pillow
 
   # pip is needed inside conda env for PyPI-only packages
   - pip
