@@ -1,0 +1,81 @@
+week_start,date,day_of_week,department,appointment_type,provider_name,location,slot_start_time_local,slot_duration_minutes,slot_status
+2026-03-02,2026-03-02,Monday,Cardiology,New Patient Consult,Dr. L. Nguyen,Main Cardiology Clinic - Downtown,08:30,30,AVAILABLE
+2026-03-02,2026-03-02,Monday,Cardiology,Follow-up Visit,Dr. L. Nguyen,Main Cardiology Clinic - Downtown,09:15,30,FULL
+2026-03-02,2026-03-02,Monday,Cardiology,Follow-up Visit,Dr. L. Nguyen,Main Cardiology Clinic - Downtown,10:00,30,FULL
+2026-03-02,2026-03-02,Monday,Cardiology,Follow-up Visit,Dr. L. Nguyen,Main Cardiology Clinic - Downtown,10:45,30,FULL
+2026-03-02,2026-03-02,Monday,Cardiology,New Patient Consult,Dr. L. Nguyen,Main Cardiology Clinic - Downtown,13:00,30,AVAILABLE
+2026-03-02,2026-03-02,Monday,Cardiology,Follow-up Visit,Dr. L. Nguyen,Main Cardiology Clinic - Downtown,13:45,30,AVAILABLE
+2026-03-02,2026-03-02,Monday,Cardiology,Follow-up Visit,Dr. L. Nguyen,Main Cardiology Clinic - Downtown,14:30,30,AVAILABLE
+2026-03-02,2026-03-02,Monday,Cardiology,Follow-up Visit,Dr. L. Nguyen,Main Cardiology Clinic - Downtown,15:15,30,AVAILABLE
+2026-03-02,2026-03-03,Tuesday,Cardiology,New Patient Consult,Dr. S. Ramirez,Westside Medical Building,08:30,30,AVAILABLE
+2026-03-02,2026-03-03,Tuesday,Cardiology,Follow-up Visit,Dr. S. Ramirez,Westside Medical Building,09:15,30,FULL
+2026-03-02,2026-03-03,Tuesday,Cardiology,Follow-up Visit,Dr. S. Ramirez,Westside Medical Building,10:00,30,FULL
+2026-03-02,2026-03-03,Tuesday,Cardiology,Follow-up Visit,Dr. S. Ramirez,Westside Medical Building,10:45,30,FULL
+2026-03-02,2026-03-03,Tuesday,Cardiology,New Patient Consult,Dr. S. Ramirez,Westside Medical Building,13:00,30,AVAILABLE
+2026-03-02,2026-03-03,Tuesday,Cardiology,Follow-up Visit,Dr. S. Ramirez,Westside Medical Building,13:45,30,AVAILABLE
+2026-03-02,2026-03-03,Tuesday,Cardiology,Follow-up Visit,Dr. S. Ramirez,Westside Medical Building,14:30,30,AVAILABLE
+2026-03-02,2026-03-03,Tuesday,Cardiology,Follow-up Visit,Dr. S. Ramirez,Westside Medical Building,15:15,30,AVAILABLE
+2026-03-02,2026-03-04,Wednesday,Cardiology,New Patient Consult,Dr. K. Thompson,Riverside Specialty Center,08:30,30,FULL
+2026-03-02,2026-03-04,Wednesday,Cardiology,Follow-up Visit,Dr. K. Thompson,Riverside Specialty Center,09:15,30,FULL
+2026-03-02,2026-03-04,Wednesday,Cardiology,Follow-up Visit,Dr. K. Thompson,Riverside Specialty Center,10:00,30,AVAILABLE
+2026-03-02,2026-03-04,Wednesday,Cardiology,Follow-up Visit,Dr. K. Thompson,Riverside Specialty Center,10:45,30,AVAILABLE
+2026-03-02,2026-03-04,Wednesday,Cardiology,New Patient Consult,Dr. K. Thompson,Riverside Specialty Center,13:00,30,AVAILABLE
+2026-03-02,2026-03-04,Wednesday,Cardiology,Follow-up Visit,Dr. K. Thompson,Riverside Specialty Center,13:45,30,AVAILABLE
+2026-03-02,2026-03-04,Wednesday,Cardiology,Follow-up Visit,Dr. K. Thompson,Riverside Specialty Center,14:30,30,AVAILABLE
+2026-03-02,2026-03-04,Wednesday,Cardiology,Follow-up Visit,Dr. K. Thompson,Riverside Specialty Center,15:15,30,AVAILABLE
+2026-03-02,2026-03-05,Thursday,Cardiology,New Patient Consult,Dr. A. Patel,Main Cardiology Clinic - Downtown,08:30,30,FULL
+2026-03-02,2026-03-05,Thursday,Cardiology,Follow-up Visit,Dr. A. Patel,Main Cardiology Clinic - Downtown,09:15,30,FULL
+2026-03-02,2026-03-05,Thursday,Cardiology,Follow-up Visit,Dr. A. Patel,Main Cardiology Clinic - Downtown,10:00,30,AVAILABLE
+2026-03-02,2026-03-05,Thursday,Cardiology,Follow-up Visit,Dr. A. Patel,Main Cardiology Clinic - Downtown,10:45,30,AVAILABLE
+2026-03-02,2026-03-05,Thursday,Cardiology,New Patient Consult,Dr. A. Patel,Main Cardiology Clinic - Downtown,13:00,30,AVAILABLE
+2026-03-02,2026-03-05,Thursday,Cardiology,Follow-up Visit,Dr. A. Patel,Main Cardiology Clinic - Downtown,13:45,30,AVAILABLE
+2026-03-02,2026-03-05,Thursday,Cardiology,Follow-up Visit,Dr. A. Patel,Main Cardiology Clinic - Downtown,14:30,30,AVAILABLE
+2026-03-02,2026-03-05,Thursday,Cardiology,Follow-up Visit,Dr. A. Patel,Main Cardiology Clinic - Downtown,15:15,30,AVAILABLE
+2026-03-02,2026-03-06,Friday,Cardiology,New Patient Consult,Dr. L. Nguyen,Westside Medical Building,08:30,30,AVAILABLE
+2026-03-02,2026-03-06,Friday,Cardiology,Follow-up Visit,Dr. L. Nguyen,Westside Medical Building,09:15,30,AVAILABLE
+2026-03-02,2026-03-06,Friday,Cardiology,Follow-up Visit,Dr. L. Nguyen,Westside Medical Building,10:00,30,AVAILABLE
+2026-03-02,2026-03-06,Friday,Cardiology,Follow-up Visit,Dr. L. Nguyen,Westside Medical Building,10:45,30,AVAILABLE
+2026-03-02,2026-03-06,Friday,Cardiology,New Patient Consult,Dr. L. Nguyen,Westside Medical Building,13:00,30,AVAILABLE
+2026-03-02,2026-03-06,Friday,Cardiology,Follow-up Visit,Dr. L. Nguyen,Westside Medical Building,13:45,30,AVAILABLE
+2026-03-02,2026-03-06,Friday,Cardiology,Follow-up Visit,Dr. L. Nguyen,Westside Medical Building,14:30,30,AVAILABLE
+2026-03-02,2026-03-06,Friday,Cardiology,Follow-up Visit,Dr. L. Nguyen,Westside Medical Building,15:15,30,FULL
+2026-03-09,2026-03-09,Monday,Cardiology,New Patient Consult,Dr. A. Patel,Westside Medical Building,08:30,30,AVAILABLE
+2026-03-09,2026-03-09,Monday,Cardiology,Follow-up Visit,Dr. A. Patel,Westside Medical Building,09:15,30,FULL
+2026-03-09,2026-03-09,Monday,Cardiology,Follow-up Visit,Dr. A. Patel,Westside Medical Building,10:00,30,FULL
+2026-03-09,2026-03-09,Monday,Cardiology,Follow-up Visit,Dr. A. Patel,Westside Medical Building,10:45,30,FULL
+2026-03-09,2026-03-09,Monday,Cardiology,New Patient Consult,Dr. A. Patel,Westside Medical Building,13:00,30,AVAILABLE
+2026-03-09,2026-03-09,Monday,Cardiology,Follow-up Visit,Dr. A. Patel,Westside Medical Building,13:45,30,AVAILABLE
+2026-03-09,2026-03-09,Monday,Cardiology,Follow-up Visit,Dr. A. Patel,Westside Medical Building,14:30,30,AVAILABLE
+2026-03-09,2026-03-09,Monday,Cardiology,Follow-up Visit,Dr. A. Patel,Westside Medical Building,15:15,30,AVAILABLE
+2026-03-09,2026-03-10,Tuesday,Cardiology,New Patient Consult,Dr. L. Nguyen,Riverside Specialty Center,08:30,30,AVAILABLE
+2026-03-09,2026-03-10,Tuesday,Cardiology,Follow-up Visit,Dr. L. Nguyen,Riverside Specialty Center,09:15,30,FULL
+2026-03-09,2026-03-10,Tuesday,Cardiology,Follow-up Visit,Dr. L. Nguyen,Riverside Specialty Center,10:00,30,FULL
+2026-03-09,2026-03-10,Tuesday,Cardiology,Follow-up Visit,Dr. L. Nguyen,Riverside Specialty Center,10:45,30,FULL
+2026-03-09,2026-03-10,Tuesday,Cardiology,New Patient Consult,Dr. L. Nguyen,Riverside Specialty Center,13:00,30,AVAILABLE
+2026-03-09,2026-03-10,Tuesday,Cardiology,Follow-up Visit,Dr. L. Nguyen,Riverside Specialty Center,13:45,30,AVAILABLE
+2026-03-09,2026-03-10,Tuesday,Cardiology,Follow-up Visit,Dr. L. Nguyen,Riverside Specialty Center,14:30,30,AVAILABLE
+2026-03-09,2026-03-10,Tuesday,Cardiology,Follow-up Visit,Dr. L. Nguyen,Riverside Specialty Center,15:15,30,AVAILABLE
+2026-03-09,2026-03-11,Wednesday,Cardiology,New Patient Consult,Dr. S. Ramirez,Main Cardiology Clinic - Downtown,08:30,30,FULL
+2026-03-09,2026-03-11,Wednesday,Cardiology,Follow-up Visit,Dr. S. Ramirez,Main Cardiology Clinic - Downtown,09:15,30,FULL
+2026-03-09,2026-03-11,Wednesday,Cardiology,Follow-up Visit,Dr. S. Ramirez,Main Cardiology Clinic - Downtown,10:00,30,AVAILABLE
+2026-03-09,2026-03-11,Wednesday,Cardiology,Follow-up Visit,Dr. S. Ramirez,Main Cardiology Clinic - Downtown,10:45,30,AVAILABLE
+2026-03-09,2026-03-11,Wednesday,Cardiology,New Patient Consult,Dr. S. Ramirez,Main Cardiology Clinic - Downtown,13:00,30,AVAILABLE
+2026-03-09,2026-03-11,Wednesday,Cardiology,Follow-up Visit,Dr. S. Ramirez,Main Cardiology Clinic - Downtown,13:45,30,AVAILABLE
+2026-03-09,2026-03-11,Wednesday,Cardiology,Follow-up Visit,Dr. S. Ramirez,Main Cardiology Clinic - Downtown,14:30,30,AVAILABLE
+2026-03-09,2026-03-11,Wednesday,Cardiology,Follow-up Visit,Dr. S. Ramirez,Main Cardiology Clinic - Downtown,15:15,30,AVAILABLE
+2026-03-09,2026-03-12,Thursday,Cardiology,New Patient Consult,Dr. K. Thompson,Westside Medical Building,08:30,30,FULL
+2026-03-09,2026-03-12,Thursday,Cardiology,Follow-up Visit,Dr. K. Thompson,Westside Medical Building,09:15,30,FULL
+2026-03-09,2026-03-12,Thursday,Cardiology,Follow-up Visit,Dr. K. Thompson,Westside Medical Building,10:00,30,AVAILABLE
+2026-03-09,2026-03-12,Thursday,Cardiology,Follow-up Visit,Dr. K. Thompson,Westside Medical Building,10:45,30,AVAILABLE
+2026-03-09,2026-03-12,Thursday,Cardiology,New Patient Consult,Dr. K. Thompson,Westside Medical Building,13:00,30,AVAILABLE
+2026-03-09,2026-03-12,Thursday,Cardiology,Follow-up Visit,Dr. K. Thompson,Westside Medical Building,13:45,30,AVAILABLE
+2026-03-09,2026-03-12,Thursday,Cardiology,Follow-up Visit,Dr. K. Thompson,Westside Medical Building,14:30,30,AVAILABLE
+2026-03-09,2026-03-12,Thursday,Cardiology,Follow-up Visit,Dr. K. Thompson,Westside Medical Building,15:15,30,AVAILABLE
+2026-03-09,2026-03-13,Friday,Cardiology,New Patient Consult,Dr. A. Patel,Riverside Specialty Center,08:30,30,AVAILABLE
+2026-03-09,2026-03-13,Friday,Cardiology,Follow-up Visit,Dr. A. Patel,Riverside Specialty Center,09:15,30,AVAILABLE
+2026-03-09,2026-03-13,Friday,Cardiology,Follow-up Visit,Dr. A. Patel,Riverside Specialty Center,10:00,30,AVAILABLE
+2026-03-09,2026-03-13,Friday,Cardiology,Follow-up Visit,Dr. A. Patel,Riverside Specialty Center,10:45,30,AVAILABLE
+2026-03-09,2026-03-13,Friday,Cardiology,New Patient Consult,Dr. A. Patel,Riverside Specialty Center,13:00,30,AVAILABLE
+2026-03-09,2026-03-13,Friday,Cardiology,Follow-up Visit,Dr. A. Patel,Riverside Specialty Center,13:45,30,AVAILABLE
+2026-03-09,2026-03-13,Friday,Cardiology,Follow-up Visit,Dr. A. Patel,Riverside Specialty Center,14:30,30,AVAILABLE
+2026-03-09,2026-03-13,Friday,Cardiology,Follow-up Visit,Dr. A. Patel,Riverside Specialty Center,15:15,30,FULL
