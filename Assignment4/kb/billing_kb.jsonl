@@ -1,0 +1,5 @@
+{"id": "billing_001", "question": "Is my visit covered by insurance?", "answer": "Coverage depends on your specific plan. Contact your insurer or our billing department to verify benefits.", "tags": ["insurance", "billing"]}
+{"id": "billing_002", "question": "What is a deductible and copay?", "answer": "A copay is a fixed fee paid at the time of service. A deductible is the amount you pay before insurance begins covering costs.", "tags": ["deductible", "copay", "insurance"]}
+{"id": "billing_003", "question": "Why did I receive multiple bills?", "answer": "You may receive separate bills for facility fees, provider services, or laboratory tests.", "tags": ["billing"]}
+{"id": "billing_004", "question": "How do I update my insurance information?", "answer": "Provide updated insurance details through the patient portal or contact our billing office directly.", "tags": ["insurance", "billing"]}
+{"id": "billing_005", "question": "What payment options are available?", "answer": "We accept credit cards, checks, online payments, and offer payment plans for qualifying balances.", "tags": ["payments", "billing"]}

@@ -1,0 +1,5 @@
+{"id": "primary_care_001", "question": "How often should I schedule a physical exam?", "answer": "Adults should have a routine physical annually or as recommended based on age and health conditions.", "tags": ["physical", "checkup", "prevention"]}
+{"id": "primary_care_002", "question": "Can I get lab work done during my visit?", "answer": "Yes, many routine labs can be performed in-office or ordered through an affiliated laboratory.", "tags": ["labs", "tests"]}
+{"id": "primary_care_003", "question": "Do you provide vaccinations?", "answer": "Yes, we offer routine adult immunizations including flu, COVID-19, tetanus, and other recommended vaccines.", "tags": ["vaccinations", "prevention"]}
+{"id": "primary_care_004", "question": "How do I request a specialist referral?", "answer": "Discuss your symptoms with your Primary Care provider, who can evaluate and issue a referral if needed.", "tags": ["referral", "appointments"]}
+{"id": "primary_care_005", "question": "Can I discuss multiple concerns in one appointment?", "answer": "Yes, but complex issues may require additional appointments to ensure adequate time for evaluation.", "tags": ["appointments"]}

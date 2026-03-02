@@ -1,0 +1,5 @@
+{"id": "radiology_001", "question": "How do I prepare for a CT scan?", "answer": "Follow any fasting instructions provided. Inform staff about allergies, especially to contrast dye, and disclose pregnancy if applicable.", "tags": ["prep", "imaging", "contrast"]}
+{"id": "radiology_002", "question": "Is radiation from X-rays safe?", "answer": "X-rays use low levels of radiation and are generally safe. Technicians take precautions to minimize exposure.", "tags": ["radiation", "imaging"]}
+{"id": "radiology_003", "question": "Do I need contrast for my MRI?", "answer": "Some MRIs require contrast to improve image clarity. Your provider will determine if it is necessary.", "tags": ["contrast", "imaging"]}
+{"id": "radiology_004", "question": "How long does imaging take?", "answer": "Most X-rays take 10–15 minutes, while CT or MRI scans may take 30–60 minutes depending on the study.", "tags": ["imaging"]}
+{"id": "radiology_005", "question": "How will I receive my results?", "answer": "Results are reviewed by a radiologist and sent to your ordering provider, who will discuss findings with you.", "tags": ["results", "imaging"]}

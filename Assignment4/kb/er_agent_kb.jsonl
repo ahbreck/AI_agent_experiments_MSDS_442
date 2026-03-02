@@ -1,0 +1,5 @@
+{"id": "er_001", "question": "Should I go to the ER or urgent care?", "answer": "Go to the ER for chest pain, stroke symptoms, severe injuries, heavy bleeding, or difficulty breathing. Urgent care is appropriate for minor injuries or mild illnesses.", "tags": ["urgent", "symptoms"]}
+{"id": "er_002", "question": "What should I bring to the ER?", "answer": "Bring a photo ID, insurance card, list of medications, allergies, and any relevant medical history if available.", "tags": ["prep", "insurance"]}
+{"id": "er_003", "question": "How long is the wait time?", "answer": "Patients are treated based on medical urgency. Critical cases are seen first, so wait times vary.", "tags": ["urgent"]}
+{"id": "er_004", "question": "Will I be admitted to the hospital?", "answer": "Admission depends on your diagnosis and condition. The ER physician will determine if inpatient care is required.", "tags": ["results"]}
+{"id": "er_005", "question": "Can someone stay with me in the ER?", "answer": "Visitor policies depend on hospital guidelines and patient condition. Check with staff upon arrival.", "tags": ["urgent"]}
