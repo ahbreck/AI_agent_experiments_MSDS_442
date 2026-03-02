@@ -1,0 +1,20 @@
+patient_id,department,test_name,result_status,resulted_datetime_local,review_status,reviewed_datetime_local,reviewed_by,released_to_patient
+10001,Primary Care,Complete Blood Count (CBC),FINAL,2026-02-27 14:35,REVIEWED,2026-02-28 09:10,Dr. Maya Patel,TRUE
+10001,Primary Care,Basic Metabolic Panel (BMP),FINAL,2026-02-27 14:35,REVIEWED,2026-02-28 09:10,Dr. Maya Patel,TRUE
+10001,Primary Care,Lipid Panel,FINAL,2026-02-19 11:05,REVIEWED,2026-02-20 16:25,Dr. Maya Patel,TRUE
+10001,Primary Care,Hemoglobin A1c,FINAL,2026-02-19 11:05,REVIEWED,2026-02-20 16:25,Dr. Maya Patel,TRUE
+10001,Primary Care,Thyroid Stimulating Hormone (TSH),FINAL,2026-02-10 08:40,REVIEWED,2026-02-11 13:55,Dr. Maya Patel,TRUE
+10002,Primary Care,Urinalysis,FINAL,2026-02-26 10:20,NOT_REVIEWED,,,FALSE
+10002,Primary Care,Urine Culture,PRELIM,2026-02-26 10:20,NOT_REVIEWED,,,FALSE
+10002,Primary Care,Rapid Strep Test,FINAL,2026-02-16 15:45,REVIEWED,2026-02-16 18:05,Dr. Hannah Lee,TRUE
+10002,Primary Care,COVID-19 PCR,FINAL,2026-02-05 12:30,REVIEWED,2026-02-05 17:20,Dr. Hannah Lee,TRUE
+10003,Primary Care,Vitamin D (25-hydroxy),FINAL,2026-02-25 09:15,REVIEWED,2026-02-26 14:05,Dr. Samuel Nguyen,TRUE
+10003,Primary Care,Ferritin,FINAL,2026-02-25 09:15,REVIEWED,2026-02-26 14:05,Dr. Samuel Nguyen,TRUE
+10003,Primary Care,Iron & TIBC,FINAL,2026-02-25 09:15,REVIEWED,2026-02-26 14:05,Dr. Samuel Nguyen,TRUE
+10004,Primary Care,Hemoglobin A1c,FINAL,2026-02-22 13:50,NOT_REVIEWED,,,FALSE
+10004,Primary Care,Comprehensive Metabolic Panel (CMP),FINAL,2026-02-22 13:50,NOT_REVIEWED,,,FALSE
+10004,Primary Care,Urine Microalbumin/Creatinine Ratio,FINAL,2026-02-22 13:50,NOT_REVIEWED,,,FALSE
+10005,Primary Care,Pap Test (Cervical Cytology),FINAL,2026-02-12 10:05,REVIEWED,2026-02-17 09:30,Dr. Aisha Robinson,TRUE
+10005,Primary Care,HPV Test,FINAL,2026-02-12 10:05,REVIEWED,2026-02-17 09:30,Dr. Aisha Robinson,TRUE
+10006,Primary Care,Prostate-Specific Antigen (PSA),FINAL,2026-02-24 08:10,REVIEWED,2026-02-24 16:40,Dr. Elena Garcia,TRUE
+10006,Cardiology,Troponin I,FINAL,2026-02-23 21:05,REVIEWED,2026-02-23 22:10,Dr. Omar Shah,TRUE
