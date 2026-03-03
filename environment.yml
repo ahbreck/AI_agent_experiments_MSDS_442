@@ -46,3 +46,5 @@ dependencies:
       - grandalf
       - markdown
       - nbstripout
+      - chromadb
+      - tiktoken
