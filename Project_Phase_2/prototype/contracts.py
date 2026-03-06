@@ -55,5 +55,12 @@ class GlobalState:
     route_trace: List[Dict[str, Any]] = field(default_factory=list)
     domain_states: Dict[str, Dict[str, Any]] = field(default_factory=dict)
     pending_question: Optional[str] = None
+    pending_slot_type: Optional[str] = None
+    pending_slot_target_story_id: Optional[str] = None
+    pending_turn_created: Optional[int] = None
+    turn_index: int = 0
+    last_active_turn_index: Optional[int] = None
+    router_reason: Optional[str] = None
+    router_metrics: Dict[str, Any] = field(default_factory=dict)
     last_response: Optional[str] = None
     global_errors: List[str] = field(default_factory=list)

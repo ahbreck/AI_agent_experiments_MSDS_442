@@ -4,6 +4,7 @@
 - Top-level operator router (domain routing)
 - In-domain story router
 - Layered state (`GlobalState` + per-domain context)
+- Memory checkpointer (`MemorySaver`) keyed by `thread_id` for multi-user simulation
 - 3 working story handlers:
   - `bm_story_1`
   - `ds_story_2`
@@ -21,3 +22,7 @@ python .\prototype_cli.py
 1. Add a handler in `prototype/stories/`.
 2. Register it in `prototype/catalog.py` (`STORY_CATALOG` and `DOMAIN_TO_STORIES`).
 3. Keep handler signature: `StoryRequest -> StoryResult`.
+
+## Multi-user threads
+- Use `orchestrator.invoke(query, thread_id=\"user_a\")`.
+- Different `thread_id` values maintain separate state snapshots in `MemorySaver`.
