@@ -19,7 +19,7 @@ def _read_workouts(member_id: str, start_date: str, end_date: str, types: Option
     q = """
     SELECT *
     FROM workouts
-    WHERE member_id = ?
+    WHERE REPLACE(REPLACE(UPPER(member_id), '-', ''), '_', '') = ?
       AND date >= ?
       AND date <= ?
     """
@@ -110,7 +110,7 @@ def run_data_science_story2(req: StoryRequest) -> StoryResult:
     member_id, start_date, end_date = _parse_request(req.user_query, fallback_member=fallback_member)
 
     if not member_id:
-        ask = "What is your member_id (e.g., MB-001)? If dates are missing I will analyze the last 8 weeks."
+        ask = "What is your member_id (e.g., MB001)? If dates are missing I will analyze the last 8 weeks."
         return StoryResult(
             story_id=req.story_id,
             response_text=ask,

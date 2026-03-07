@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Literal, Optional
 
 from ..contracts import StoryRequest, StoryResult
-from ..utils import normalize_member_id
+from ..utils import member_id_aliases, normalize_member_id
 
 PROJECT_PHASE_2 = Path(__file__).resolve().parents[2]
 DB_PATH = PROJECT_PHASE_2 / "kb" / "MembershipFraud" / "membership_fraud.db"
@@ -25,30 +25,35 @@ def _infer_timeframe(user_text: str) -> Timeframe:
 
 
 def _read_security_events(member_id: str, timeframe: Timeframe, max_events: int = 5) -> List[Dict[str, Any]]:
+    aliases = member_id_aliases(member_id)
+    if not aliases:
+        return []
+    placeholders = ",".join(["?"] * len(aliases))
+
     with sqlite3.connect(DB_PATH) as conn:
         conn.row_factory = sqlite3.Row
         cur = conn.cursor()
 
         if timeframe == "most_recent":
-            sql = """
+            sql = f"""
             SELECT event_id, member_id, event_ts, login_location, device_type, risk_level, trigger_reason, recommended_action
             FROM security_events
-            WHERE member_id = ?
+            WHERE REPLACE(REPLACE(UPPER(member_id), '-', ''), '_', '') IN ({placeholders})
             ORDER BY event_ts DESC
             LIMIT ?
             """
-            return [dict(r) for r in cur.execute(sql, (member_id.replace("MB-", "M"), max_events)).fetchall()]
+            return [dict(r) for r in cur.execute(sql, (*aliases, max_events)).fetchall()]
 
         days = 7 if timeframe == "last_7_days" else 30
         cutoff = (datetime.now() - timedelta(days=days)).isoformat(timespec="seconds")
-        sql = """
+        sql = f"""
         SELECT event_id, member_id, event_ts, login_location, device_type, risk_level, trigger_reason, recommended_action
         FROM security_events
-        WHERE member_id = ? AND event_ts >= ?
+        WHERE REPLACE(REPLACE(UPPER(member_id), '-', ''), '_', '') IN ({placeholders}) AND event_ts >= ?
         ORDER BY event_ts DESC
         LIMIT ?
         """
-        return [dict(r) for r in cur.execute(sql, (member_id.replace("MB-", "M"), cutoff, max_events)).fetchall()]
+        return [dict(r) for r in cur.execute(sql, (*aliases, cutoff, max_events)).fetchall()]
 
 
 def _guide_actions(event: Dict[str, Any]) -> List[str]:
@@ -69,7 +74,7 @@ def run_membership_fraud_story1(req: StoryRequest) -> StoryResult:
     timeframe = _infer_timeframe(req.user_query)
 
     if not member_id:
-        ask = "I can check that security alert, what is your member_id (e.g., MB-001)?"
+        ask = "I can check that security alert, what is your member_id (e.g., MB001)?"
         return StoryResult(
             story_id=req.story_id,
             response_text=ask,

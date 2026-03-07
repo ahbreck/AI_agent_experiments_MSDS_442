@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Any, Dict, List
 
 from ..contracts import StoryRequest, StoryResult
-from ..utils import parse_last_n_weeks
+from ..utils import normalize_campaign_id, normalize_member_id, parse_last_n_weeks
 
 PROJECT_PHASE_2 = Path(__file__).resolve().parents[2]
 DB_PATH = PROJECT_PHASE_2 / "kb" / "BusinessMarketing" / "brand_feedback.db"
@@ -19,13 +19,18 @@ def _read_campaign_feedback(filters: Dict[str, Any]) -> List[Dict[str, Any]]:
 
     campaign_ids = filters.get("campaign_ids")
     if campaign_ids:
-        where.append(f"campaign_id IN ({','.join(['?'] * len(campaign_ids))})")
+        where.append(f"REPLACE(REPLACE(UPPER(campaign_id), '-', ''), '_', '') IN ({','.join(['?'] * len(campaign_ids))})")
         params.extend(campaign_ids)
 
     channels = filters.get("feedback_channels")
     if channels:
         where.append(f"feedback_channel IN ({','.join(['?'] * len(channels))})")
         params.extend([c.lower() for c in channels])
+
+    member_id = filters.get("member_id")
+    if member_id:
+        where.append("REPLACE(REPLACE(UPPER(member_id), '-', ''), '_', '') = ?")
+        params.append(member_id)
 
     if filters.get("start_date"):
         where.append("created_at >= ?")
@@ -88,11 +93,15 @@ def _aggregate(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
 
 
 def _parse_filters(user_text: str) -> Dict[str, Any]:
-    campaign_ids = re.findall(r"\bCAMP[_-]?\d+\b", user_text.upper())
+    campaign_ids_raw = re.findall(r"\bCAMP[_-]?\d+\b", user_text.upper())
+    campaign_ids = [normalize_campaign_id(cid) for cid in campaign_ids_raw]
+    campaign_ids = [cid for cid in campaign_ids if cid]
+    member_id = normalize_member_id(user_text)
     channels = [c for c in ["email", "app", "social", "web"] if re.search(rf"\b{c}\b", user_text.lower())]
     start_date, end_date, timeframe_label = parse_last_n_weeks(user_text, default_weeks=4)
     return {
         "campaign_ids": campaign_ids or None,
+        "member_id": member_id,
         "feedback_channels": channels or None,
         "start_date": start_date,
         "end_date": end_date,

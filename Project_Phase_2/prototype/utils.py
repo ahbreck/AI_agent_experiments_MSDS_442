@@ -2,27 +2,52 @@ from __future__ import annotations
 
 import re
 from datetime import date, timedelta
-from typing import Optional, Tuple
+from typing import List, Optional, Tuple
+
+
+def normalize_token_alnum(raw: Optional[str]) -> Optional[str]:
+    if not raw:
+        return None
+    token = re.sub(r"[^A-Z0-9]", "", raw.strip().upper())
+    return token or None
 
 
 def normalize_member_id(raw: Optional[str]) -> Optional[str]:
-    if not raw:
+    token = normalize_token_alnum(raw)
+    if not token:
         return None
-    text = raw.strip().upper()
 
-    m = re.search(r"\bMB-\d{3}\b", text)
+    m = re.search(r"MB(\d{3})", token)
     if m:
-        return m.group(0)
+        return f"MB{m.group(1)}"
 
-    m = re.search(r"\bM\d{3}\b", text)
+    m = re.search(r"M(\d{3})", token)
     if m:
-        return "MB-" + m.group(0)[1:]
+        return f"MB{m.group(1)}"
 
-    m = re.search(r"\b\d{3}\b", text)
+    m = re.search(r"(\d{3})", token)
     if m:
-        return "MB-" + m.group(0)
+        return f"MB{m.group(1)}"
 
     return None
+
+
+def normalize_campaign_id(raw: Optional[str]) -> Optional[str]:
+    token = normalize_token_alnum(raw)
+    if not token:
+        return None
+    m = re.search(r"CAMP(\d+)", token)
+    if m:
+        return f"CAMP{m.group(1)}"
+    return None
+
+
+def member_id_aliases(raw: Optional[str]) -> List[str]:
+    norm = normalize_member_id(raw)
+    if not norm:
+        return []
+    digits = norm[-3:]
+    return [norm, f"M{digits}", f"MB-{digits}"]
 
 
 def parse_last_n_weeks(user_text: str, default_weeks: int) -> Tuple[str, str, str]:
