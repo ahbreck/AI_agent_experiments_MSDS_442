@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Literal, Optional
 
 from ..contracts import StoryRequest, StoryResult
-from ..utils import member_id_aliases, normalize_member_id
+from ..utils import extract_explicit_member_id, member_id_aliases
 
 PROJECT_PHASE_2 = Path(__file__).resolve().parents[2]
 DB_PATH = PROJECT_PHASE_2 / "kb" / "MembershipFraud" / "membership_fraud.db"
@@ -70,7 +70,7 @@ def _guide_actions(event: Dict[str, Any]) -> List[str]:
 
 
 def run_membership_fraud_story1(req: StoryRequest) -> StoryResult:
-    member_id = normalize_member_id(req.user_query) or req.member.member_id
+    member_id = extract_explicit_member_id(req.user_query) or req.member.member_id
     timeframe = _infer_timeframe(req.user_query)
 
     if not member_id:

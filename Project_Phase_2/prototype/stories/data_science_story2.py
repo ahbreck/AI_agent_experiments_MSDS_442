@@ -9,7 +9,7 @@ from statistics import mean
 from typing import Any, Dict, List, Optional, Tuple
 
 from ..contracts import StoryRequest, StoryResult
-from ..utils import normalize_member_id, parse_date_range_from_text
+from ..utils import extract_explicit_member_id, parse_date_range_from_text
 
 PROJECT_PHASE_2 = Path(__file__).resolve().parents[2]
 DB_PATH = PROJECT_PHASE_2 / "kb" / "DataScience" / "peloton_workouts.sqlite"
@@ -34,7 +34,7 @@ def _read_workouts(member_id: str, start_date: str, end_date: str, types: Option
 
 
 def _parse_request(user_text: str, fallback_member: Optional[str]) -> Tuple[Optional[str], str, str]:
-    member = normalize_member_id(user_text) or fallback_member
+    member = extract_explicit_member_id(user_text) or fallback_member
     start, end = parse_date_range_from_text(user_text, default_weeks=8)
     return member, start, end
 

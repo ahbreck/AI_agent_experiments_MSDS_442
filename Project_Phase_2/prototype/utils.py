@@ -42,6 +42,16 @@ def normalize_campaign_id(raw: Optional[str]) -> Optional[str]:
     return None
 
 
+def extract_explicit_member_id(raw: Optional[str]) -> Optional[str]:
+    if not raw:
+        return None
+    text = raw.strip().upper()
+    m = re.search(r"\bMB[\s_-]?\d{3}\b", text)
+    if m:
+        return normalize_member_id(m.group(0))
+    return None
+
+
 def member_id_aliases(raw: Optional[str]) -> List[str]:
     norm = normalize_member_id(raw)
     if not norm:

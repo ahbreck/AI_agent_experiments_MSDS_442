@@ -8,7 +8,7 @@ from langgraph.checkpoint.memory import MemorySaver
 
 from .catalog import DOMAIN_TO_STORIES, STORY_CATALOG
 from .contracts import CanonicalMember, GlobalState, RouteDecision, StoryRequest, StoryResult
-from .utils import normalize_member_id
+from .utils import extract_explicit_member_id
 
 
 CONT_HIGH = 0.70
@@ -122,7 +122,7 @@ class AgenticOrchestrator:
 
     def _slot_value_present(self, user_query: str) -> bool:
         if self.state.pending_slot_type == "member_id":
-            return normalize_member_id(user_query) is not None
+            return extract_explicit_member_id(user_query) is not None
         return False
 
     def _is_fresh_domain_high(self, top_score: float, margin: float) -> bool:
@@ -148,7 +148,7 @@ class AgenticOrchestrator:
         )
 
     def _sync_member(self, user_query: str) -> None:
-        norm = normalize_member_id(user_query)
+        norm = extract_explicit_member_id(user_query)
         if norm:
             self.state.member = CanonicalMember(
                 member_id=norm,

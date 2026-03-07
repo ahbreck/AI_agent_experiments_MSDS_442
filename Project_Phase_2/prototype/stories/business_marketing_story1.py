@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Any, Dict, List
 
 from ..contracts import StoryRequest, StoryResult
-from ..utils import normalize_campaign_id, normalize_member_id, parse_last_n_weeks
+from ..utils import extract_explicit_member_id, normalize_campaign_id, parse_last_n_weeks
 
 PROJECT_PHASE_2 = Path(__file__).resolve().parents[2]
 DB_PATH = PROJECT_PHASE_2 / "kb" / "BusinessMarketing" / "brand_feedback.db"
@@ -96,7 +96,7 @@ def _parse_filters(user_text: str) -> Dict[str, Any]:
     campaign_ids_raw = re.findall(r"\bCAMP[_-]?\d+\b", user_text.upper())
     campaign_ids = [normalize_campaign_id(cid) for cid in campaign_ids_raw]
     campaign_ids = [cid for cid in campaign_ids if cid]
-    member_id = normalize_member_id(user_text)
+    member_id = extract_explicit_member_id(user_text)
     channels = [c for c in ["email", "app", "social", "web"] if re.search(rf"\b{c}\b", user_text.lower())]
     start_date, end_date, timeframe_label = parse_last_n_weeks(user_text, default_weeks=4)
     return {
