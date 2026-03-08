@@ -209,7 +209,8 @@ class AgenticOrchestrator:
             "You are a top-level orchestrator router.\n"
             "Choose exactly one domain based on the user message and recent chat context.\n"
             f"Valid domains: {domain_list}, clarify.\n"
-            "Use clarify only if domain cannot be chosen reliably."
+            "Use clarify only if domain cannot be chosen reliably.\n"
+            "If the current user message clearly indicates a different domain than the active domain, route to the new domain."
         )
         user = (
             f"ACTIVE_DOMAIN: {self.state.active_domain}\n"
@@ -342,6 +343,15 @@ class AgenticOrchestrator:
             domain = top_domain if self._is_fresh_domain_high(top_score, margin) else "clarify"
             metrics["domain_llm_confidence"] = 0.0
             metrics["domain_llm_rationale"] = "LLM failed; deterministic fallback applied."
+
+        # Guardrail: when lexical signal is clearly strong, do not allow LLM clarify to block routing.
+        if domain == "clarify" and self._is_fresh_domain_high(top_score, margin):
+            domain = top_domain
+            metrics["domain_llm_rationale"] = (
+                f"{metrics.get('domain_llm_rationale', '')} "
+                f"Overridden by strong lexical domain signal: top_domain={top_domain}, top_score={top_score}, margin={margin}."
+            ).strip()
+            metrics["domain_guardrail_override"] = "llm_clarify_to_top_domain"
 
         if domain == "clarify":
             return None, None, "ambiguous_clarify_llm", metrics, True
