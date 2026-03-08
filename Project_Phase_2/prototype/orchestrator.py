@@ -1,10 +1,19 @@
 from __future__ import annotations
 
 from dataclasses import asdict
-from typing import Any, Dict, List, Optional, Tuple
+import os
+from typing import Any, Dict, List, Optional, Tuple, TypedDict
 
+try:
+    from dotenv import find_dotenv, load_dotenv
+except ImportError:  # optional dependency
+    find_dotenv = None
+    load_dotenv = None
+from langchain_openai import ChatOpenAI
+from langgraph.graph import END, StateGraph
 from langgraph.checkpoint.base import empty_checkpoint
 from langgraph.checkpoint.memory import MemorySaver
+from pydantic import BaseModel, Field
 
 from .catalog import DOMAIN_TO_STORIES, STORY_CATALOG
 from .contracts import CanonicalMember, GlobalState, RouteDecision, StoryRequest, StoryResult
@@ -17,6 +26,30 @@ FRESH_MARGIN = 0.20
 PENDING_TTL_TURNS = 3
 
 
+class DomainRouteOutput(BaseModel):
+    domain: str = Field(description="One of: business_marketing, data_science, membership_fraud, clarify")
+    confidence: float = Field(default=0.0, ge=0.0, le=1.0)
+    rationale: str = Field(default="")
+
+
+class StoryRouteOutput(BaseModel):
+    story_id: str
+    confidence: float = Field(default=0.0, ge=0.0, le=1.0)
+    rationale: str = Field(default="")
+
+
+class OrchestratorGraphState(TypedDict, total=False):
+    user_query: str
+    domain: Optional[str]
+    story_id: Optional[str]
+    reason: str
+    metrics: Dict[str, Any]
+    should_clarify: bool
+    response: str
+    story_output: Dict[str, Any]
+    follow_up_question: Optional[str]
+
+
 class AgenticOrchestrator:
     def __init__(
         self,
@@ -24,9 +57,17 @@ class AgenticOrchestrator:
         checkpointer: Optional[MemorySaver] = None,
         checkpoint_ns: str = "phase2_prototype",
     ):
+        if load_dotenv and find_dotenv:
+            load_dotenv(find_dotenv())
+        if not os.getenv("OPENAI_API_KEY"):
+            raise RuntimeError(
+                "OPENAI_API_KEY is not set. Add it to your environment or .env before initializing AgenticOrchestrator."
+            )
         self.state = state or GlobalState()
         self.checkpointer = checkpointer or MemorySaver()
         self.checkpoint_ns = checkpoint_ns
+        self.llm = ChatOpenAI(model="gpt-4o-mini", temperature=0)
+        self.graph = self._build_graph()
 
     def _thread_config(self, thread_id: str) -> Dict[str, Any]:
         return {"configurable": {"thread_id": thread_id, "checkpoint_ns": self.checkpoint_ns}}
@@ -147,6 +188,81 @@ class AgenticOrchestrator:
             missing_slots=[],
         )
 
+    def _coerce_domain(self, raw: str) -> Optional[str]:
+        value = (raw or "").strip().lower()
+        if value in DOMAIN_TO_STORIES:
+            return value
+        if value in {"membership", "fraud", "membershipfraud", "membership_fraud"}:
+            return "membership_fraud"
+        if value in {"business", "marketing", "business_marketing"}:
+            return "business_marketing"
+        if value in {"data", "data_science", "datascience"}:
+            return "data_science"
+        if value in {"clarify", "ambiguous", "unknown", "none"}:
+            return "clarify"
+        return None
+
+    def _llm_domain_route(self, user_query: str) -> Tuple[str, float, str]:
+        domain_list = ", ".join(sorted(DOMAIN_TO_STORIES.keys()))
+        recent = self.state.messages[-6:]
+        system = (
+            "You are a top-level orchestrator router.\n"
+            "Choose exactly one domain based on the user message and recent chat context.\n"
+            f"Valid domains: {domain_list}, clarify.\n"
+            "Use clarify only if domain cannot be chosen reliably."
+        )
+        user = (
+            f"ACTIVE_DOMAIN: {self.state.active_domain}\n"
+            f"ACTIVE_STORY: {self.state.active_story_id}\n"
+            f"PENDING_SLOT_TYPE: {self.state.pending_slot_type}\n"
+            f"RECENT_MESSAGES: {recent}\n"
+            f"USER_QUERY: {user_query}"
+        )
+        structured = self.llm.with_structured_output(DomainRouteOutput)
+        out = structured.invoke([("system", system), ("user", user)])
+        domain = self._coerce_domain(out.domain) or "clarify"
+        return domain, float(out.confidence), out.rationale
+
+    def _llm_story_route(self, domain: str, user_query: str) -> RouteDecision:
+        candidates = DOMAIN_TO_STORIES[domain]
+        titles = {sid: STORY_CATALOG[sid].title for sid in candidates}
+        keywords = {sid: STORY_CATALOG[sid].keywords for sid in candidates}
+
+        system = (
+            "You are a second-level story router.\n"
+            "Select exactly one story_id from the allowed list for the chosen domain.\n"
+            "Output only a valid allowed story_id."
+        )
+        user = (
+            f"DOMAIN: {domain}\n"
+            f"ALLOWED_STORY_IDS: {candidates}\n"
+            f"STORY_TITLES: {titles}\n"
+            f"STORY_KEYWORDS: {keywords}\n"
+            f"ACTIVE_STORY: {self.state.active_story_id}\n"
+            f"USER_QUERY: {user_query}"
+        )
+        structured = self.llm.with_structured_output(StoryRouteOutput)
+        out = structured.invoke([("system", system), ("user", user)])
+
+        picked = out.story_id if out.story_id in candidates else None
+        if not picked:
+            fallback = self._story_router(domain, user_query)
+            return RouteDecision(
+                target=fallback.target,
+                confidence=max(0.51, fallback.confidence),
+                rationale=f"LLM returned invalid story_id='{out.story_id}'. Fallback to keyword router.",
+                fallback_target=fallback.fallback_target,
+                missing_slots=fallback.missing_slots,
+            )
+
+        return RouteDecision(
+            target=picked,
+            confidence=float(out.confidence),
+            rationale=out.rationale or f"LLM selected story '{picked}' in domain '{domain}'.",
+            fallback_target=self.state.active_story_id,
+            missing_slots=[],
+        )
+
     def _sync_member(self, user_query: str) -> None:
         norm = extract_explicit_member_id(user_query)
         if norm:
@@ -191,10 +307,11 @@ class AgenticOrchestrator:
             )
         return "I can route this to BusinessMarketing, DataScience, or MembershipFraud. Please clarify which area you want."
 
-    def _route_turn(self, user_query: str) -> Tuple[Optional[str], Optional[str], str, Dict[str, Any], bool]:
+    def _route_turn_graph(self, user_query: str) -> Tuple[Optional[str], Optional[str], str, Dict[str, Any], bool]:
         domain_scores = self._compute_domain_scores(user_query)
         top_domain, top_score, second_domain, second_score, margin = self._top_two_domains(domain_scores)
         continuation_score = self._compute_continuation_score()
+        pending_valid = self._is_pending_valid()
 
         metrics = {
             "continuation_score": continuation_score,
@@ -207,31 +324,130 @@ class AgenticOrchestrator:
             "active_domain_before": self.state.active_domain,
             "active_story_before": self.state.active_story_id,
             "pending_slot_used": False,
+            "router_style": "llm_langgraph",
         }
 
-        pending_valid = self._is_pending_valid()
         if pending_valid and self._slot_value_present(user_query) and self.state.pending_slot_target_story_id:
             sid = self.state.pending_slot_target_story_id
             dom = STORY_CATALOG[sid].domain
             metrics["pending_slot_used"] = True
             return dom, sid, "pending_slot_fulfilled", metrics, False
 
-        if pending_valid and self._is_fresh_domain_high(top_score, margin) and self.state.active_domain and top_domain != self.state.active_domain:
-            sid = self._story_router(top_domain, user_query).target
-            return top_domain, sid, "pending_slot_abandoned_fresh_route", metrics, False
+        try:
+            domain, domain_conf, domain_rationale = self._llm_domain_route(user_query)
+            metrics["domain_llm_confidence"] = round(domain_conf, 2)
+            metrics["domain_llm_rationale"] = domain_rationale
+        except Exception as exc:
+            self.state.global_errors.append(f"domain_router_llm_error: {exc}")
+            domain = top_domain if self._is_fresh_domain_high(top_score, margin) else "clarify"
+            metrics["domain_llm_confidence"] = 0.0
+            metrics["domain_llm_rationale"] = "LLM failed; deterministic fallback applied."
 
-        if self._is_fresh_domain_high(top_score, margin):
-            sid = self._story_router(top_domain, user_query).target
-            reason = "continuation_but_fresh_domain" if (continuation_score >= CONT_HIGH and self.state.active_domain and top_domain != self.state.active_domain) else "fresh_domain_route"
-            return top_domain, sid, reason, metrics, False
+        if domain == "clarify":
+            return None, None, "ambiguous_clarify_llm", metrics, True
 
-        if continuation_score >= CONT_HIGH and self.state.active_domain:
-            if self.state.active_story_id and self.state.active_story_id in STORY_CATALOG:
-                return self.state.active_domain, self.state.active_story_id, "continuation_to_active_story", metrics, False
-            sid = self._story_router(self.state.active_domain, user_query).target
-            return self.state.active_domain, sid, "continuation_to_active_domain", metrics, False
+        if domain not in DOMAIN_TO_STORIES:
+            return None, None, "invalid_domain_clarify", metrics, True
 
-        return None, None, "ambiguous_clarify", metrics, True
+        try:
+            story_decision = self._llm_story_route(domain, user_query)
+            metrics["story_llm_confidence"] = round(story_decision.confidence, 2)
+            metrics["story_llm_rationale"] = story_decision.rationale
+        except Exception as exc:
+            self.state.global_errors.append(f"story_router_llm_error: {exc}")
+            story_decision = self._story_router(domain, user_query)
+            metrics["story_llm_confidence"] = 0.0
+            metrics["story_llm_rationale"] = "LLM failed; deterministic story fallback applied."
+
+        return domain, story_decision.target, "llm_domain_story_route", metrics, False
+
+    def _build_graph(self):
+        builder = StateGraph(OrchestratorGraphState)
+
+        def route_node(gs: OrchestratorGraphState) -> OrchestratorGraphState:
+            user_query = gs["user_query"]
+            domain, story_id, reason, metrics, should_clarify = self._route_turn_graph(user_query)
+            self.state.router_reason = reason
+            self.state.router_metrics = metrics
+            self.state.route_trace.append(
+                {
+                    "router": "decision_router",
+                    "router_reason": reason,
+                    "selected_domain": domain,
+                    "selected_story_id": story_id,
+                    "continuation_score": metrics.get("continuation_score"),
+                    "domain_scores": metrics.get("domain_scores"),
+                    "margin": metrics.get("margin"),
+                    "pending_slot_used": metrics.get("pending_slot_used"),
+                    "domain_llm_confidence": metrics.get("domain_llm_confidence"),
+                    "story_llm_confidence": metrics.get("story_llm_confidence"),
+                }
+            )
+            return {
+                "domain": domain,
+                "story_id": story_id,
+                "reason": reason,
+                "metrics": metrics,
+                "should_clarify": should_clarify,
+            }
+
+        def clarify_node(gs: OrchestratorGraphState) -> OrchestratorGraphState:
+            metrics = gs.get("metrics", {})
+            text = self._clarify_response(metrics.get("top_domain"), metrics.get("second_domain"))
+            self.state.last_response = text
+            self.state.pending_question = text
+            self.state.messages.append({"role": "assistant", "content": text})
+            return {"response": text, "story_output": {}, "follow_up_question": text}
+
+        def story_node(gs: OrchestratorGraphState) -> OrchestratorGraphState:
+            domain = gs["domain"]
+            story_id = gs["story_id"]
+            user_query = gs["user_query"]
+            assert domain is not None and story_id is not None
+
+            self.state.active_domain = domain
+            self.state.active_story_id = story_id
+            if domain not in self.state.domain_states:
+                self.state.domain_states[domain] = {"domain_name": domain, "domain_context": {}}
+
+            req = StoryRequest(
+                story_id=story_id,
+                user_query=user_query,
+                messages=self.state.messages,
+                member=self.state.member,
+                domain_context=self.state.domain_states[domain],
+            )
+            handler = STORY_CATALOG[story_id].handler
+            result = handler(req)
+            self._merge_state_updates(result, domain=domain)
+            self._update_pending_from_result(result)
+            self.state.last_response = result.response_text
+            self.state.last_active_turn_index = self.state.turn_index
+            self.state.messages.append({"role": "assistant", "content": result.response_text})
+
+            return {
+                "response": result.response_text,
+                "story_output": result.story_output,
+                "follow_up_question": result.follow_up_question,
+            }
+
+        def route_after_route(gs: OrchestratorGraphState) -> str:
+            return "clarify" if gs.get("should_clarify") else "story"
+
+        builder.add_node("route", route_node)
+        builder.add_node("clarify", clarify_node)
+        builder.add_node("invoke_story", story_node)
+        builder.set_entry_point("route")
+        builder.add_conditional_edges("route", route_after_route, {"clarify": "clarify", "story": "invoke_story"})
+        builder.add_edge("clarify", END)
+        builder.add_edge("invoke_story", END)
+        return builder.compile()
+
+    def get_orchestrator_mermaid(self) -> str:
+        return self.graph.get_graph().draw_mermaid()
+
+    def get_orchestrator_graph(self):
+        return self.graph
 
     def invoke(self, user_query: str, thread_id: str = "default") -> Dict[str, Any]:
         self.state = self._load_thread_state(thread_id=thread_id)
@@ -240,75 +456,22 @@ class AgenticOrchestrator:
         self.state.messages.append({"role": "user", "content": user_query})
         self._sync_member(user_query)
 
-        domain, story_id, reason, metrics, should_clarify = self._route_turn(user_query)
-        self.state.router_reason = reason
-        self.state.router_metrics = metrics
+        out_state = self.graph.invoke({"user_query": user_query})
+        reason = out_state.get("reason")
+        metrics = out_state.get("metrics", {})
+        response = out_state.get("response", "")
+        story_output = out_state.get("story_output")
+        follow_up_question = out_state.get("follow_up_question")
 
-        self.state.route_trace.append(
-            {
-                "router": "decision_router",
-                "router_reason": reason,
-                "selected_domain": domain,
-                "selected_story_id": story_id,
-                "continuation_score": metrics.get("continuation_score"),
-                "domain_scores": metrics.get("domain_scores"),
-                "margin": metrics.get("margin"),
-                "pending_slot_used": metrics.get("pending_slot_used"),
-            }
-        )
-
-        if should_clarify:
-            top = metrics.get("top_domain")
-            second = metrics.get("second_domain")
-            text = self._clarify_response(top, second)
-            self.state.last_response = text
-            self.state.pending_question = text
-            self.state.messages.append({"role": "assistant", "content": text})
-            self._save_thread_state(thread_id=thread_id)
-            return {
-                "response": text,
-                "thread_id": thread_id,
-                "active_domain": self.state.active_domain,
-                "active_story_id": self.state.active_story_id,
-                "router_reason": reason,
-                "router_metrics": metrics,
-                "route_trace": self.state.route_trace,
-                "state": asdict(self.state),
-            }
-
-        assert domain is not None and story_id is not None
-        self.state.active_domain = domain
-        self.state.active_story_id = story_id
-
-        if domain not in self.state.domain_states:
-            self.state.domain_states[domain] = {"domain_name": domain, "domain_context": {}}
-
-        req = StoryRequest(
-            story_id=story_id,
-            user_query=user_query,
-            messages=self.state.messages,
-            member=self.state.member,
-            domain_context=self.state.domain_states[domain],
-        )
-
-        handler = STORY_CATALOG[story_id].handler
-        result = handler(req)
-
-        self._merge_state_updates(result, domain=domain)
-        self._update_pending_from_result(result)
-
-        self.state.last_response = result.response_text
-        self.state.last_active_turn_index = self.state.turn_index
-        self.state.messages.append({"role": "assistant", "content": result.response_text})
         self._save_thread_state(thread_id=thread_id)
 
         return {
-            "response": result.response_text,
+            "response": response,
             "thread_id": thread_id,
-            "active_domain": domain,
-            "active_story_id": story_id,
-            "story_output": result.story_output,
-            "follow_up_question": result.follow_up_question,
+            "active_domain": self.state.active_domain,
+            "active_story_id": self.state.active_story_id,
+            "story_output": story_output,
+            "follow_up_question": follow_up_question,
             "router_reason": reason,
             "router_metrics": metrics,
             "route_trace": self.state.route_trace,
