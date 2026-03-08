@@ -7,8 +7,9 @@ import sqlite3
 from collections import defaultdict
 from datetime import date, datetime, timedelta
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Literal, Optional, Tuple, Union
 
+from pydantic import BaseModel, Field, ValidationError
 from ..contracts import StoryRequest, StoryResult
 from ..utils import extract_explicit_member_id, parse_date_range_from_text
 
@@ -27,6 +28,55 @@ ALL_METRICS = [
 ]
 SUPPORTED_TYPES = ["cycling", "tread", "rowing", "strength", "yoga"]
 TOOL_ORDER = ["summarize_time_series", "zone_distribution", "segment_by", "detect_anomalies"]
+
+
+class SummarizeArgs(BaseModel):
+    metrics: List[str] = Field(min_length=1)
+    freq: str = "W"
+
+
+class ZoneArgs(BaseModel):
+    pass
+
+
+class SegmentArgs(BaseModel):
+    by: List[str] = Field(min_length=1)
+    metrics: List[str] = Field(min_length=1)
+
+
+class AnomalyArgs(BaseModel):
+    metric: str
+
+
+class SummarizeStep(BaseModel):
+    tool: Literal["summarize_time_series"]
+    args: SummarizeArgs
+
+
+class ZoneStep(BaseModel):
+    tool: Literal["zone_distribution"]
+    args: ZoneArgs = Field(default_factory=ZoneArgs)
+
+
+class SegmentStep(BaseModel):
+    tool: Literal["segment_by"]
+    args: SegmentArgs
+
+
+class AnomalyStep(BaseModel):
+    tool: Literal["detect_anomalies"]
+    args: AnomalyArgs
+
+
+PlanStep = Union[SummarizeStep, ZoneStep, SegmentStep, AnomalyStep]
+
+
+class AnalysisPlan(BaseModel):
+    member_id: str
+    start_date: str
+    end_date: str
+    types: Optional[List[str]] = None
+    steps: List[PlanStep] = Field(min_length=1, max_length=5)
 
 PLAN_SYSTEM = """
 You are a workout analytics planner.
@@ -458,45 +508,32 @@ def _intent_scores(user_text: str) -> Dict[str, int]:
     return out
 
 
-def _normalize_plan(candidate: Dict[str, Any], member_id: str, start_date: str, end_date: str, types: Optional[List[str]]) -> Optional[Dict[str, Any]]:
-    steps = candidate.get("steps")
-    if not isinstance(steps, list) or not steps:
-        return None
-
+def _coerce_plan_from_model(plan: AnalysisPlan, member_id: str, start_date: str, end_date: str, types: Optional[List[str]]) -> Optional[Dict[str, Any]]:
     normalized_steps: List[Dict[str, Any]] = []
-    for step in steps[:5]:
-        if not isinstance(step, dict):
+    for step in plan.steps[:5]:
+        if isinstance(step, SummarizeStep):
+            metrics = [m for m in step.args.metrics if m in ALL_METRICS]
+            if not metrics:
+                continue
+            freq = str(step.args.freq or "W").upper()
+            normalized_steps.append(
+                {"tool": "summarize_time_series", "args": {"metrics": metrics, "freq": freq if freq in {"D", "W", "M"} else "W"}}
+            )
             continue
-        tool_name = step.get("tool")
-        args = step.get("args", {})
-        if tool_name not in TOOL_ORDER or not isinstance(args, dict):
+        if isinstance(step, ZoneStep):
+            normalized_steps.append({"tool": "zone_distribution", "args": {}})
             continue
-        if tool_name == "summarize_time_series":
-            m = args.get("metrics")
-            f = str(args.get("freq", "W")).upper()
-            if not isinstance(m, list) or not m:
+        if isinstance(step, SegmentStep):
+            by = [x for x in step.args.by if x in {"type", "weekday", "time_bucket"}]
+            metrics = [m for m in step.args.metrics if m in ALL_METRICS]
+            if not by or not metrics:
                 continue
-            m_clean = [x for x in m if x in ALL_METRICS]
-            if not m_clean:
+            normalized_steps.append({"tool": "segment_by", "args": {"by": by, "metrics": metrics}})
+            continue
+        if isinstance(step, AnomalyStep):
+            if step.args.metric not in ALL_METRICS:
                 continue
-            normalized_steps.append({"tool": tool_name, "args": {"metrics": m_clean, "freq": f if f in {"D", "W", "M"} else "W"}})
-        elif tool_name == "zone_distribution":
-            normalized_steps.append({"tool": tool_name, "args": {}})
-        elif tool_name == "segment_by":
-            by = args.get("by")
-            m = args.get("metrics")
-            if not isinstance(by, list) or not by or not isinstance(m, list) or not m:
-                continue
-            by_clean = [x for x in by if x in {"type", "weekday", "time_bucket"}]
-            m_clean = [x for x in m if x in ALL_METRICS]
-            if not by_clean or not m_clean:
-                continue
-            normalized_steps.append({"tool": tool_name, "args": {"by": by_clean, "metrics": m_clean}})
-        elif tool_name == "detect_anomalies":
-            metric = args.get("metric")
-            if metric not in ALL_METRICS:
-                continue
-            normalized_steps.append({"tool": tool_name, "args": {"metric": metric}})
+            normalized_steps.append({"tool": "detect_anomalies", "args": {"metric": step.args.metric}})
 
     if not normalized_steps:
         return None
@@ -506,7 +543,7 @@ def _normalize_plan(candidate: Dict[str, Any], member_id: str, start_date: str, 
         "member_id": member_id,
         "start_date": start_date,
         "end_date": end_date,
-        "types": types,
+        "types": [t for t in (types or []) if t in SUPPORTED_TYPES] or None,
         "steps": normalized_steps[:5],
         "plan_system": PLAN_SYSTEM.strip(),
     }
@@ -540,7 +577,23 @@ def _maybe_llm_plan(user_text: str, member_id: str, start_date: str, end_date: s
         parsed = _safe_json_extract(text)
         if not parsed:
             return None
-        return _normalize_plan(parsed, member_id=member_id, start_date=start_date, end_date=end_date, types=types)
+        candidate = {
+            "member_id": member_id,
+            "start_date": start_date,
+            "end_date": end_date,
+            "types": types,
+            "steps": parsed.get("steps", []),
+        }
+        plan_model = AnalysisPlan.model_validate(candidate)
+        return _coerce_plan_from_model(
+            plan_model,
+            member_id=member_id,
+            start_date=start_date,
+            end_date=end_date,
+            types=types,
+        )
+    except ValidationError:
+        return None
     except Exception:
         return None
 
@@ -606,18 +659,47 @@ def _plan_from_query(user_text: str, member_id: str, start_date: str, end_date: 
         ]
 
     deduped.sort(key=lambda s: TOOL_ORDER.index(s["tool"]))
+    try:
+        plan_model = AnalysisPlan.model_validate(
+            {
+                "member_id": member_id,
+                "start_date": start_date,
+                "end_date": end_date,
+                "types": types,
+                "steps": deduped[:5],
+            }
+        )
+        out = _coerce_plan_from_model(
+            plan_model,
+            member_id=member_id,
+            start_date=start_date,
+            end_date=end_date,
+            types=types,
+        )
+        if not out:
+            raise ValueError("Coerced plan had no valid steps.")
+    except (ValidationError, ValueError):
+        fallback_model = AnalysisPlan.model_validate(
+            {
+                "member_id": member_id,
+                "start_date": start_date,
+                "end_date": end_date,
+                "types": types,
+                "steps": [{"tool": "summarize_time_series", "args": {"metrics": SAFE_DEFAULT_METRICS, "freq": "W"}}],
+            }
+        )
+        out = _coerce_plan_from_model(
+            fallback_model,
+            member_id=member_id,
+            start_date=start_date,
+            end_date=end_date,
+            types=types,
+        )
 
-    return {
-        "member_id": member_id,
-        "start_date": start_date,
-        "end_date": end_date,
-        "types": types,
-        "steps": deduped[:5],
-        "plan_system": PLAN_SYSTEM.strip(),
-        "planner_mode": "heuristic",
-        "intent_scores": scores,
-        "metrics_selected": metrics,
-    }
+    out["planner_mode"] = "heuristic"
+    out["intent_scores"] = scores
+    out["metrics_selected"] = metrics
+    return out
 
 
 def _execute_plan(plan: Dict[str, Any], rows: List[Dict[str, Any]]) -> Dict[str, Any]:
