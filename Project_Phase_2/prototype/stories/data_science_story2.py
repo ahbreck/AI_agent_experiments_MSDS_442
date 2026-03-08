@@ -7,8 +7,9 @@ import sqlite3
 from collections import defaultdict
 from datetime import date, datetime, timedelta
 from pathlib import Path
-from typing import Any, Dict, List, Literal, Optional, Tuple, Union
+from typing import Any, Dict, List, Literal, Optional, Tuple, TypedDict, Union
 
+from langgraph.graph import END, StateGraph
 from pydantic import BaseModel, Field, ValidationError
 from ..contracts import StoryRequest, StoryResult
 from ..utils import extract_explicit_member_id, parse_date_range_from_text
@@ -28,6 +29,21 @@ ALL_METRICS = [
 ]
 SUPPORTED_TYPES = ["cycling", "tread", "rowing", "strength", "yoga"]
 TOOL_ORDER = ["summarize_time_series", "zone_distribution", "segment_by", "detect_anomalies"]
+
+
+class DataScienceStoryState(TypedDict, total=False):
+    user_text: str
+    fallback_member: Optional[str]
+    member_id: Optional[str]
+    start_date: str
+    end_date: str
+    types: Optional[List[str]]
+    plan: Dict[str, Any]
+    rows: List[Dict[str, Any]]
+    tool_results: Dict[str, Any]
+    response_text: str
+    follow_up_question: Optional[str]
+    row_count: int
 
 
 class SummarizeArgs(BaseModel):
@@ -803,12 +819,107 @@ def _interpret_results(user_text: str, plan: Dict[str, Any], tool_results: Dict[
     return "\n".join(lines)
 
 
-def run_data_science_story2(req: StoryRequest) -> StoryResult:
-    fallback_member = req.member.member_id
-    member_id, start_date, end_date, types = _parse_request(req.user_query, fallback_member=fallback_member)
-
+def _plan_node(state: DataScienceStoryState) -> DataScienceStoryState:
+    user_text = state.get("user_text", "")
+    fallback_member = state.get("fallback_member")
+    member_id, start_date, end_date, types = _parse_request(user_text, fallback_member=fallback_member)
     if not member_id:
         ask = "What is your member_id (e.g., MB001)? If dates are missing I will analyze the last 8 weeks."
+        return {"response_text": ask, "follow_up_question": ask}
+
+    plan = _plan_from_query(
+        user_text=user_text,
+        member_id=member_id,
+        start_date=start_date,
+        end_date=end_date,
+        types=types,
+    )
+    return {
+        "member_id": member_id,
+        "start_date": start_date,
+        "end_date": end_date,
+        "types": types,
+        "plan": plan,
+    }
+
+
+def _run_tools_node(state: DataScienceStoryState) -> DataScienceStoryState:
+    member_id = state.get("member_id")
+    if not member_id:
+        return {}
+    start_date = state["start_date"]
+    end_date = state["end_date"]
+    types = state.get("types")
+    plan = state["plan"]
+
+    rows = _read_workouts(member_id=member_id, start_date=start_date, end_date=end_date, types=types)
+    rows_sorted = sorted(rows, key=lambda r: datetime.fromisoformat(str(r["date"])))
+
+    if not rows_sorted:
+        msg = f"I did not find workouts for {member_id} between {start_date} and {end_date}."
+        return {"rows": [], "row_count": 0, "tool_results": {}, "response_text": msg, "follow_up_question": None}
+
+    tool_results = _execute_plan(plan=plan, rows=rows_sorted)
+    return {"rows": rows_sorted, "row_count": len(rows_sorted), "tool_results": tool_results}
+
+
+def _interpret_node(state: DataScienceStoryState) -> DataScienceStoryState:
+    if state.get("response_text"):
+        return {}
+    member_id = state.get("member_id")
+    if not member_id:
+        return {}
+    rows = state.get("rows", [])
+    if not rows:
+        return {}
+    response_text = _interpret_results(state.get("user_text", ""), state["plan"], state.get("tool_results", {}))
+    return {"response_text": response_text, "follow_up_question": None}
+
+
+def _route_after_plan(state: DataScienceStoryState) -> str:
+    return "ask" if not state.get("member_id") else "go"
+
+
+def _route_after_tools(state: DataScienceStoryState) -> str:
+    return "done" if state.get("response_text") else "interpret"
+
+
+def _build_story_graph():
+    g = StateGraph(DataScienceStoryState)
+    g.add_node("plan", _plan_node)
+    g.add_node("run_tools", _run_tools_node)
+    g.add_node("interpret", _interpret_node)
+    g.set_entry_point("plan")
+    g.add_conditional_edges("plan", _route_after_plan, {"ask": END, "go": "run_tools"})
+    g.add_conditional_edges("run_tools", _route_after_tools, {"done": END, "interpret": "interpret"})
+    g.add_edge("interpret", END)
+    return g.compile()
+
+
+DATA_SCIENCE_GRAPH = None
+
+
+def _get_data_science_graph():
+    global DATA_SCIENCE_GRAPH
+    if DATA_SCIENCE_GRAPH is None:
+        DATA_SCIENCE_GRAPH = _build_story_graph()
+    return DATA_SCIENCE_GRAPH
+
+
+def get_data_science_story2_mermaid() -> str:
+    return _get_data_science_graph().get_graph().draw_mermaid()
+
+
+def run_data_science_story2(req: StoryRequest) -> StoryResult:
+    state_out = _get_data_science_graph().invoke(
+        {
+            "user_text": req.user_query,
+            "fallback_member": req.member.member_id,
+        }
+    )
+
+    if state_out.get("follow_up_question") and not state_out.get("member_id"):
+        ask = state_out["follow_up_question"]
         return StoryResult(
             story_id=req.story_id,
             response_text=ask,
@@ -816,34 +927,15 @@ def run_data_science_story2(req: StoryRequest) -> StoryResult:
             story_output={"needs_member_id": True},
         )
 
-    plan = _plan_from_query(
-        user_text=req.user_query,
-        member_id=member_id,
-        start_date=start_date,
-        end_date=end_date,
-        types=types,
-    )
-    rows = _read_workouts(member_id=member_id, start_date=start_date, end_date=end_date, types=types)
-    rows_sorted = sorted(rows, key=lambda r: datetime.fromisoformat(str(r["date"])))
-
-    if not rows_sorted:
-        msg = f"I did not find workouts for {member_id} between {start_date} and {end_date}."
-        return StoryResult(
-            story_id=req.story_id,
-            response_text=msg,
-            story_output={
-                "member_id": member_id,
-                "start_date": start_date,
-                "end_date": end_date,
-                "types": types,
-                "row_count": 0,
-                "plan": plan,
-            },
-            state_updates_global={"member": {"member_id": member_id}},
-        )
-
-    tool_results = _execute_plan(plan=plan, rows=rows_sorted)
-    response_text = _interpret_results(req.user_query, plan, tool_results)
+    member_id = state_out.get("member_id")
+    start_date = state_out.get("start_date")
+    end_date = state_out.get("end_date")
+    types = state_out.get("types")
+    plan = state_out.get("plan", {})
+    rows_sorted = state_out.get("rows", [])
+    row_count = int(state_out.get("row_count", len(rows_sorted)))
+    tool_results = state_out.get("tool_results", {})
+    response_text = state_out.get("response_text") or "I can analyze your workout trends."
 
     return StoryResult(
         story_id=req.story_id,
@@ -858,6 +950,6 @@ def run_data_science_story2(req: StoryRequest) -> StoryResult:
             "tool_results": tool_results,
             "generated_on": date.today().isoformat(),
         },
-        state_updates_global={"member": {"member_id": member_id}},
-        state_updates_domain={"last_story_summary": f"Planned {len(plan['steps'])} step(s); analyzed {len(rows_sorted)} workouts."},
+        state_updates_global={"member": {"member_id": member_id}} if member_id else {},
+        state_updates_domain={"last_story_summary": f"Planned {len(plan.get('steps', []))} step(s); analyzed {row_count} workouts."},
     )

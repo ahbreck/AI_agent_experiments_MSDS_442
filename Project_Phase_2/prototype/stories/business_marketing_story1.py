@@ -5,7 +5,11 @@ import sqlite3
 from collections import defaultdict
 from datetime import date
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional, TypedDict
+
+from langchain_openai import ChatOpenAI
+from langgraph.graph import END, StateGraph
+from pydantic import BaseModel, Field
 
 from ..contracts import StoryRequest, StoryResult
 from ..utils import extract_explicit_member_id, normalize_campaign_id, parse_last_n_weeks
@@ -14,8 +18,51 @@ PROJECT_PHASE_2 = Path(__file__).resolve().parents[2]
 DB_PATH = PROJECT_PHASE_2 / "kb" / "BusinessMarketing" / "brand_feedback.db"
 
 
+class FeedbackFilters(BaseModel):
+    campaign_ids: Optional[List[str]] = None
+    feedback_channels: Optional[List[str]] = None
+    member_id: Optional[str] = None
+    start_date: Optional[str] = None
+    end_date: Optional[str] = None
+    timeframe_label: str = "last_4_weeks"
+
+
+class ThemeStats(BaseModel):
+    theme: str
+    n: int
+    share: float
+    avg_comment_len: float
+    pos_share: float
+    neu_share: float
+    neg_share: float
+    salience: float
+
+
+class Adjustment(BaseModel):
+    title: str
+    change: str
+    why_grounded: str
+    receipts: List[str]
+
+
+class AdjustmentsLLMOutput(BaseModel):
+    adjustments: List[Adjustment] = Field(..., min_length=3, max_length=3)
+
+
+class FeedbackGraphState(TypedDict, total=False):
+    user_text: str
+    filters: Dict[str, Any]
+    feedback_rows: List[Dict[str, Any]]
+    aggregation: Dict[str, Any]
+    focus_themes: List[str]
+    adjustments: List[Dict[str, Any]]
+    response_text: str
+    follow_up_question: Optional[str]
+
+
 def _read_campaign_feedback(filters: Dict[str, Any]) -> List[Dict[str, Any]]:
-    where, params = [], []
+    where = []
+    params: List[Any] = []
 
     campaign_ids = filters.get("campaign_ids")
     if campaign_ids:
@@ -54,9 +101,9 @@ def _read_campaign_feedback(filters: Dict[str, Any]) -> List[Dict[str, Any]]:
     return rows
 
 
-def _aggregate(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
+def _aggregate_themes(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
     if not rows:
-        return {"total_n": 0, "themes": []}
+        return {"total_n": 0, "overall_avg_len": 0.0, "themes": []}
 
     by_theme: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
     for r in rows:
@@ -89,7 +136,7 @@ def _aggregate(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
         )
 
     out.sort(key=lambda x: x["salience"], reverse=True)
-    return {"total_n": total_n, "themes": out}
+    return {"total_n": total_n, "overall_avg_len": round(overall_avg_len, 2), "themes": out}
 
 
 def _parse_filters(user_text: str) -> Dict[str, Any]:
@@ -109,9 +156,31 @@ def _parse_filters(user_text: str) -> Dict[str, Any]:
     }
 
 
-def _build_adjustments(themes: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+def _select_focus_themes(theme_stats: List[ThemeStats], k: int = 4) -> List[str]:
+    if not theme_stats:
+        return []
+    by_sal = sorted(theme_stats, key=lambda t: t.salience, reverse=True)
+    focus = [t.theme for t in by_sal[:k]]
+
+    neg_sorted = sorted(theme_stats, key=lambda t: t.neg_share, reverse=True)
+    if neg_sorted and neg_sorted[0].neg_share >= 0.5 and neg_sorted[0].theme not in focus:
+        focus[-1] = neg_sorted[0].theme
+
+    mixed = [t for t in theme_stats if t.pos_share > 0.2 and t.neg_share > 0.2]
+    mixed_sorted = sorted(mixed, key=lambda t: t.salience, reverse=True)
+    if mixed_sorted and mixed_sorted[0].theme not in focus:
+        focus[-1] = mixed_sorted[0].theme
+
+    out = []
+    for x in focus:
+        if x not in out:
+            out.append(x)
+    return out
+
+
+def _deterministic_adjustments(themes: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     chosen = themes[:3]
-    adjustments = []
+    adjustments: List[Dict[str, Any]] = []
     for t in chosen:
         theme = t["theme"]
         adjustments.append(
@@ -125,49 +194,142 @@ def _build_adjustments(themes: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return adjustments
 
 
-def run_business_marketing_story1(req: StoryRequest) -> StoryResult:
-    filters = _parse_filters(req.user_query)
-    rows = _read_campaign_feedback(filters)
-    agg = _aggregate(rows)
+def _parse_node(state: FeedbackGraphState) -> FeedbackGraphState:
+    filters = _parse_filters(state.get("user_text", ""))
+    return {"filters": FeedbackFilters(**filters).model_dump()}
 
-    if agg["total_n"] == 0:
+
+def _retrieve_node(state: FeedbackGraphState) -> FeedbackGraphState:
+    rows = _read_campaign_feedback(state["filters"])
+    return {"feedback_rows": rows}
+
+
+def _aggregate_node(state: FeedbackGraphState) -> FeedbackGraphState:
+    agg = _aggregate_themes(state.get("feedback_rows", []))
+    return {"aggregation": agg}
+
+
+def _focus_node(state: FeedbackGraphState) -> FeedbackGraphState:
+    stats = [ThemeStats(**t) for t in state.get("aggregation", {}).get("themes", [])]
+    focus = _select_focus_themes(stats, k=4)
+    return {"focus_themes": focus}
+
+
+def _recommend_node(state: FeedbackGraphState, llm: ChatOpenAI) -> FeedbackGraphState:
+    themes = state.get("aggregation", {}).get("themes", [])
+    if not themes:
+        return {"adjustments": []}
+
+    focus = set(state.get("focus_themes", []))
+    focus_rows = [t for t in themes if t["theme"] in focus] or themes[:4]
+    system = (
+        "You are a brand/content strategy assistant.\n"
+        "Return exactly 3 content adjustments.\n"
+        "Content-only changes: copy, creative, messaging structure, framing, CTA, sequencing.\n"
+        "Ground strictly in provided theme stats. Do not introduce new themes. Do not claim causes.\n"
+        "Each adjustment must include 2-3 receipts citing actual numbers.\n"
+        "Output must match schema: adjustments[{title, change, why_grounded, receipts}]."
+    )
+    user = f"Theme stats (sorted by salience):\n{themes}\n\nFocus themes:\n{focus_rows}\n"
+
+    try:
+        structured = llm.with_structured_output(AdjustmentsLLMOutput)
+        out = structured.invoke([("system", system), ("user", user)])
+        return {"adjustments": [a.model_dump() for a in out.adjustments]}
+    except Exception:
+        return {"adjustments": _deterministic_adjustments(themes)}
+
+
+def _format_node(state: FeedbackGraphState) -> FeedbackGraphState:
+    filters = FeedbackFilters(**state["filters"])
+    rows = state.get("feedback_rows", [])
+    agg = state.get("aggregation", {})
+    themes = agg.get("themes", [])
+    adjustments = state.get("adjustments", [])
+
+    if not themes:
         text = (
             "No feedback matched those filters. "
             "Try widening the date range, removing channel filters, or omitting campaign_ids."
         )
-        return StoryResult(
-            story_id=req.story_id,
-            response_text=text,
-            story_output={"filters": filters, "feedback_rows": [], "aggregation": agg},
-            state_updates_domain={"last_story_summary": "No rows for applied filters."},
-        )
+        return {"response_text": text, "follow_up_question": None}
 
-    adjustments = _build_adjustments(agg["themes"])
     lines = [
         "Brand Manager Feedback Themes Summary",
-        f"Date range: {filters['start_date']}..{filters['end_date']} ({filters['timeframe_label']})",
-        f"Rows analyzed: {agg['total_n']}",
+        f"Date range: {filters.start_date}..{filters.end_date} ({filters.timeframe_label})",
+        f"Rows analyzed: {agg.get('total_n', len(rows))}",
         "Top themes:",
     ]
-    for t in agg["themes"][:5]:
+    for t in themes[:5]:
         lines.append(
             f"- {t['theme']}: n={t['n']}, share={t['share']}, neg={t['neg_share']}, pos={t['pos_share']}, salience={t['salience']}"
         )
 
     lines.append("\n3 content adjustments:")
-    for i, a in enumerate(adjustments, start=1):
+    for i, a in enumerate(adjustments[:3], start=1):
         lines.append(f"{i}. {a['title']} | {a['change']} | {a['why_grounded']}")
+
+    return {"response_text": "\n".join(lines), "follow_up_question": None}
+
+
+def _build_story_graph():
+    llm = ChatOpenAI(model="gpt-4o-mini", temperature=0)
+    g = StateGraph(FeedbackGraphState)
+
+    def recommend_node(state: FeedbackGraphState) -> FeedbackGraphState:
+        return _recommend_node(state, llm)
+
+    g.add_node("parse", _parse_node)
+    g.add_node("retrieve", _retrieve_node)
+    g.add_node("aggregate", _aggregate_node)
+    g.add_node("focus", _focus_node)
+    g.add_node("recommend", recommend_node)
+    g.add_node("format", _format_node)
+
+    g.set_entry_point("parse")
+    g.add_edge("parse", "retrieve")
+    g.add_edge("retrieve", "aggregate")
+    g.add_edge("aggregate", "focus")
+    g.add_edge("focus", "recommend")
+    g.add_edge("recommend", "format")
+    g.add_edge("format", END)
+    return g.compile()
+
+
+BUSINESS_MARKETING_GRAPH = None
+
+
+def _get_business_marketing_graph():
+    global BUSINESS_MARKETING_GRAPH
+    if BUSINESS_MARKETING_GRAPH is None:
+        BUSINESS_MARKETING_GRAPH = _build_story_graph()
+    return BUSINESS_MARKETING_GRAPH
+
+
+def get_business_marketing_story1_mermaid() -> str:
+    return _get_business_marketing_graph().get_graph().draw_mermaid()
+
+
+def run_business_marketing_story1(req: StoryRequest) -> StoryResult:
+    state_out = _get_business_marketing_graph().invoke({"user_text": req.user_query})
+    filters = state_out.get("filters", {})
+    rows = state_out.get("feedback_rows", [])
+    agg = state_out.get("aggregation", {"total_n": 0, "themes": []})
+    focus = state_out.get("focus_themes", [])
+    adjustments = state_out.get("adjustments", [])
+    text = state_out.get("response_text", "I can summarize campaign feedback.")
 
     return StoryResult(
         story_id=req.story_id,
-        response_text="\n".join(lines),
+        response_text=text,
+        follow_up_question=state_out.get("follow_up_question"),
         story_output={
             "filters": filters,
             "feedback_rows": rows,
             "aggregation": agg,
-            "focus_themes": [t["theme"] for t in agg["themes"][:4]],
+            "focus_themes": focus,
             "adjustments": adjustments,
             "generated_on": date.today().isoformat(),
         },
-        state_updates_domain={"last_story_summary": f"Analyzed {agg['total_n']} feedback rows."},
+        state_updates_domain={"last_story_summary": f"Analyzed {agg.get('total_n', 0)} feedback rows."},
     )
