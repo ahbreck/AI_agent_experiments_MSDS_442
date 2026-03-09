@@ -1,6 +1,6 @@
-# Project Phase 2 Prototype (3 stories wired)
+# Project Phase 2 Prototype (3 stories wired thus far)
 
-## What this adds
+## Features
 - Top-level operator router (domain routing)
 - In-domain story router
 - Layered state (`GlobalState` + per-domain context)
@@ -18,22 +18,10 @@ From `Project_Phase_2`:
 python .\prototype_cli.py
 ```
 
-## ID normalization (source-of-truth)
-To normalize ID fields in DB and CSV artifacts to uppercase alphanumeric (remove `_`, `-`, and other non-alphanumeric chars):
+You can also test the agentic application from the notebook wrapper:
 
-```powershell
-python .\kb\normalize_ids_source_of_truth.py --dry-run
-python .\kb\normalize_ids_source_of_truth.py --apply
-```
+`Prototype_Orchestrator_Wrapper.ipynb`
 
-The script creates timestamped backups before `--apply`.
-
-To add cross-domain `member_id` linkage into BusinessMarketing campaign feedback:
-
-```powershell
-python .\kb\BusinessMarketing\add_member_ids_to_campaign_feedback.py --dry-run
-python .\kb\BusinessMarketing\add_member_ids_to_campaign_feedback.py --apply
-```
 
 ## Add a new future story
 1. Add a handler in `prototype/stories/`.
