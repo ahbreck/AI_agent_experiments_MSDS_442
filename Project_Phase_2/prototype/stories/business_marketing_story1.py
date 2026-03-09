@@ -57,6 +57,7 @@ class FeedbackGraphState(TypedDict, total=False):
     aggregation: Dict[str, Any]
     focus_themes: List[str]
     adjustments: List[Dict[str, Any]]
+    validation_warnings: List[str]
     route_mode: str
     data_quality: Dict[str, Any]
     response_text: str
@@ -197,6 +198,31 @@ def _deterministic_adjustments(themes: List[Dict[str, Any]]) -> List[Dict[str, A
     return adjustments
 
 
+def _deterministic_adjustment_for_theme(theme: Dict[str, Any]) -> Dict[str, Any]:
+    tname = str(theme.get("theme") or "UNKNOWN_THEME")
+    n = theme.get("n", 0)
+    share = theme.get("share", 0)
+    neg_share = theme.get("neg_share", 0)
+    salience = theme.get("salience", 0)
+    return {
+        "title": f"Address {tname}",
+        "change": (
+            f"Revise campaign copy and CTA sequencing to reduce friction around '{tname}' "
+            "in primary message and first CTA step."
+        ),
+        "why_grounded": (
+            "This theme is prioritized by observed salience and sentiment mix in the selected window."
+        ),
+        "receipts": [
+            f"theme={tname}",
+            f"n={n}",
+            f"share={share}",
+            f"neg_share={neg_share}",
+            f"salience={salience}",
+        ],
+    }
+
+
 def _parse_node(state: FeedbackGraphState) -> FeedbackGraphState:
     filters = _parse_filters(state.get("user_text", ""))
     return {"filters": FeedbackFilters(**filters).model_dump()}
@@ -259,6 +285,129 @@ def _recommend_node(state: FeedbackGraphState, llm: ChatOpenAI) -> FeedbackGraph
         return {"adjustments": [a.model_dump() for a in out.adjustments]}
     except Exception:
         return {"adjustments": _deterministic_adjustments(themes)}
+
+
+def _validate_recommendations(state: FeedbackGraphState) -> Dict[str, Any]:
+    themes = state.get("aggregation", {}).get("themes", [])
+    adjustments = state.get("adjustments", [])
+    focus_themes = [str(t) for t in state.get("focus_themes", [])]
+    allowed_themes = set(focus_themes) | {str(t.get("theme")) for t in themes}
+
+    warnings: List[str] = []
+    invalid_indices: List[int] = []
+    if not adjustments:
+        return {"warnings": warnings, "invalid_indices": invalid_indices}
+
+    theme_names_sorted = sorted([t for t in allowed_themes if t], key=len, reverse=True)
+    metric_keys = {"n", "share", "neg_share", "salience"}
+
+    def _find_theme(text: str) -> Optional[str]:
+        tl = text.lower()
+        for name in theme_names_sorted:
+            if name.lower() in tl:
+                return name
+        return None
+
+    theme_metric_index: Dict[str, Dict[str, float]] = {}
+    for t in themes:
+        name = str(t.get("theme") or "")
+        if not name:
+            continue
+        theme_metric_index[name] = {}
+        for key in metric_keys:
+            try:
+                theme_metric_index[name][key] = float(t.get(key))
+            except (TypeError, ValueError):
+                continue
+
+    for idx, adj in enumerate(adjustments, start=1):
+        prior_warning_count = len(warnings)
+        if not isinstance(adj, dict):
+            warnings.append(f"adjustment_{idx}: not a dict")
+            invalid_indices.append(idx - 1)
+            continue
+
+        title = str(adj.get("title") or "").strip()
+        change = str(adj.get("change") or "").strip()
+        why = str(adj.get("why_grounded") or "").strip()
+        receipts = adj.get("receipts")
+
+        if not title:
+            warnings.append(f"adjustment_{idx}: missing title")
+        if not change:
+            warnings.append(f"adjustment_{idx}: missing change")
+        if not why:
+            warnings.append(f"adjustment_{idx}: missing why_grounded")
+        if not isinstance(receipts, list):
+            warnings.append(f"adjustment_{idx}: receipts missing or not a list")
+            receipts = []
+        elif len(receipts) < 2:
+            warnings.append(f"adjustment_{idx}: fewer than 2 receipts")
+
+        referenced_theme = _find_theme(" ".join([title, change, why]))
+        if not referenced_theme:
+            warnings.append(f"adjustment_{idx}: no recognized theme reference")
+
+        metric_receipt_count = 0
+        for receipt in receipts:
+            rtxt = str(receipt or "").strip()
+            m = re.search(r"\b(n|share|neg_share|salience)\s*=\s*([0-9]*\.?[0-9]+)\b", rtxt)
+            if not m:
+                continue
+            metric_receipt_count += 1
+            key = m.group(1)
+            try:
+                val = float(m.group(2))
+            except ValueError:
+                continue
+
+            if referenced_theme and referenced_theme in theme_metric_index and key in theme_metric_index[referenced_theme]:
+                expected = theme_metric_index[referenced_theme][key]
+                if abs(expected - val) > 1e-6:
+                    warnings.append(
+                        f"adjustment_{idx}: receipt mismatch for {referenced_theme} {key} (got {val}, expected {expected})"
+                    )
+
+        if metric_receipt_count < 2:
+            warnings.append(f"adjustment_{idx}: fewer than 2 numeric metric receipts")
+
+        if len(warnings) > prior_warning_count:
+            invalid_indices.append(idx - 1)
+
+    invalid_dedup = sorted(set(i for i in invalid_indices if 0 <= i < len(adjustments)))
+    return {"warnings": warnings, "invalid_indices": invalid_dedup}
+
+
+def _validate_node(state: FeedbackGraphState) -> FeedbackGraphState:
+    checked = _validate_recommendations(state)
+    warnings: List[str] = list(checked.get("warnings", []))
+    invalid_indices: List[int] = list(checked.get("invalid_indices", []))
+    adjustments = list(state.get("adjustments", []))
+    if not invalid_indices or not adjustments:
+        return {"validation_warnings": warnings}
+
+    themes = state.get("aggregation", {}).get("themes", [])
+    focus = [str(x) for x in state.get("focus_themes", [])]
+
+    candidate_themes: List[Dict[str, Any]] = []
+    for name in focus:
+        hit = next((t for t in themes if str(t.get("theme")) == name), None)
+        if hit:
+            candidate_themes.append(hit)
+    for t in themes:
+        if t not in candidate_themes:
+            candidate_themes.append(t)
+    if not candidate_themes:
+        return {"validation_warnings": warnings}
+
+    for replacement_order, bad_idx in enumerate(invalid_indices):
+        theme = candidate_themes[replacement_order % len(candidate_themes)]
+        adjustments[bad_idx] = _deterministic_adjustment_for_theme(theme)
+        warnings.append(
+            f"adjustment_{bad_idx + 1}: replaced with deterministic grounded adjustment for theme={theme.get('theme')}"
+        )
+
+    return {"adjustments": adjustments, "validation_warnings": warnings}
 
 
 def _format_node(state: FeedbackGraphState) -> FeedbackGraphState:
@@ -325,6 +474,7 @@ def _build_story_graph():
     g.add_node("route", _route_node)
     g.add_node("focus", _focus_node)
     g.add_node("recommend", recommend_node)
+    g.add_node("validate", _validate_node)
     g.add_node("format", _format_node)
 
     def route_after_route(state: FeedbackGraphState) -> str:
@@ -336,7 +486,8 @@ def _build_story_graph():
     g.add_edge("aggregate", "route")
     g.add_conditional_edges("route", route_after_route, {"no_data": "format", "low_data": "format", "normal": "focus"})
     g.add_edge("focus", "recommend")
-    g.add_edge("recommend", "format")
+    g.add_edge("recommend", "validate")
+    g.add_edge("validate", "format")
     g.add_edge("format", END)
     return g.compile()
 
@@ -362,6 +513,7 @@ def run_business_marketing_story1(req: StoryRequest) -> StoryResult:
     agg = state_out.get("aggregation", {"total_n": 0, "themes": []})
     focus = state_out.get("focus_themes", [])
     adjustments = state_out.get("adjustments", [])
+    validation_warnings = state_out.get("validation_warnings", [])
     route_mode = state_out.get("route_mode", "normal")
     data_quality = state_out.get("data_quality", {})
     text = state_out.get("response_text", "I can summarize campaign feedback.")
@@ -376,6 +528,7 @@ def run_business_marketing_story1(req: StoryRequest) -> StoryResult:
             "aggregation": agg,
             "focus_themes": focus,
             "adjustments": adjustments,
+            "validation_warnings": validation_warnings,
             "route_mode": route_mode,
             "data_quality": data_quality,
             "generated_on": date.today().isoformat(),

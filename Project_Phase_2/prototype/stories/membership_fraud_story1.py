@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import re
 import sqlite3
 from datetime import datetime, timedelta
@@ -15,6 +16,9 @@ from ..utils import extract_explicit_member_id, member_id_aliases
 
 PROJECT_PHASE_2 = Path(__file__).resolve().parents[2]
 DB_PATH = PROJECT_PHASE_2 / "kb" / "MembershipFraud" / "membership_fraud.db"
+SECURITY_HELP_JSONL_PATH = PROJECT_PHASE_2 / "kb" / "MembershipFraud" / "security_help_kb.jsonl"
+SECURITY_HELP_CHROMA_DIR = PROJECT_PHASE_2 / "kb" / "MembershipFraud" / "security_help_chroma"
+SECURITY_HELP_COLLECTION = "membership_fraud_security_help"
 
 Timeframe = Literal["most_recent", "last_7_days", "last_30_days"]
 
@@ -37,6 +41,7 @@ class SecurityState(TypedDict, total=False):
     follow_up_question: Optional[str]
     recommended_actions: List[str]
     latest_event: Dict[str, Any]
+    security_help_snippets: List[Dict[str, Any]]
 
 
 def _infer_timeframe(user_text: str) -> Timeframe:
@@ -74,6 +79,191 @@ def _user_says_recognized(text: str) -> bool:
             "yes that was me",
         ]
     )
+
+
+def _user_asks_security_howto(text: str) -> bool:
+    t = text.lower()
+    howto_signals = [
+        "how do i",
+        "how to",
+        "what are the steps",
+        "where do i",
+        "walk me through",
+        "can you help me set up",
+        "help me set up",
+    ]
+    security_topics = [
+        "password",
+        "mfa",
+        "multi-factor",
+        "multi factor",
+        "2fa",
+        "two-factor",
+        "two factor",
+        "sign out",
+        "all sessions",
+        "unknown device",
+        "recovery",
+        "account locked",
+        "unlock account",
+    ]
+
+    howto = any(k in t for k in howto_signals)
+    topic = any(k in t for k in security_topics)
+    direct_password_or_mfa = (
+        ("password" in t and any(k in t for k in ["change", "reset", "forgot"]))
+        or ("mfa" in t)
+        or ("2fa" in t)
+        or ("multi-factor" in t)
+        or ("two-factor" in t)
+    )
+    return (howto and topic) or direct_password_or_mfa
+
+
+SECURITY_HELP_ROWS_CACHE: Optional[List[Dict[str, Any]]] = None
+SECURITY_HELP_STORE = None
+SECURITY_HELP_STORE_READY = False
+
+
+def _tokenize(text: str) -> List[str]:
+    return [tok for tok in re.split(r"[^a-z0-9]+", text.lower()) if len(tok) >= 3]
+
+
+def _load_security_help_rows() -> List[Dict[str, Any]]:
+    global SECURITY_HELP_ROWS_CACHE
+    if SECURITY_HELP_ROWS_CACHE is not None:
+        return SECURITY_HELP_ROWS_CACHE
+    if not SECURITY_HELP_JSONL_PATH.exists():
+        SECURITY_HELP_ROWS_CACHE = []
+        return SECURITY_HELP_ROWS_CACHE
+
+    rows: List[Dict[str, Any]] = []
+    for line in SECURITY_HELP_JSONL_PATH.read_text(encoding="utf-8").splitlines():
+        txt = line.strip()
+        if not txt:
+            continue
+        try:
+            obj = json.loads(txt)
+            if isinstance(obj, dict):
+                rows.append(obj)
+        except Exception:
+            continue
+    SECURITY_HELP_ROWS_CACHE = rows
+    return rows
+
+
+def _get_security_help_store():
+    global SECURITY_HELP_STORE, SECURITY_HELP_STORE_READY
+    if SECURITY_HELP_STORE_READY:
+        return SECURITY_HELP_STORE
+    SECURITY_HELP_STORE_READY = True
+
+    if not SECURITY_HELP_CHROMA_DIR.exists():
+        return None
+
+    try:
+        from langchain_chroma import Chroma
+        from langchain_openai import OpenAIEmbeddings
+    except Exception:
+        return None
+
+    try:
+        SECURITY_HELP_STORE = Chroma(
+            collection_name=SECURITY_HELP_COLLECTION,
+            persist_directory=str(SECURITY_HELP_CHROMA_DIR),
+            embedding_function=OpenAIEmbeddings(model="text-embedding-3-small"),
+        )
+    except Exception:
+        SECURITY_HELP_STORE = None
+    return SECURITY_HELP_STORE
+
+
+def _retrieve_security_help(query: str, k: int = 3) -> List[Dict[str, Any]]:
+    store = _get_security_help_store()
+    out: List[Dict[str, Any]] = []
+    if store is not None:
+        try:
+            pairs = store.similarity_search_with_score(query, k=k)
+            for doc, distance in pairs:
+                md = doc.metadata or {}
+                dist = float(distance) if distance is not None else 1.0
+                score = 1.0 / (1.0 + max(dist, 0.0))
+                out.append(
+                    {
+                        "id": md.get("id") or "security-help",
+                        "question": md.get("question") or "",
+                        "answer": md.get("answer") or "",
+                        "score": score,
+                        "text": doc.page_content,
+                    }
+                )
+            if out:
+                return out
+        except Exception:
+            pass
+
+    rows = _load_security_help_rows()
+    if not rows:
+        return []
+    q_tokens = set(_tokenize(query))
+    scored: List[Dict[str, Any]] = []
+    for i, row in enumerate(rows, start=1):
+        q = str(row.get("question") or "")
+        a = str(row.get("answer") or "")
+        full = f"{q} {a}"
+        row_tokens = set(_tokenize(full))
+        overlap = len(q_tokens.intersection(row_tokens))
+        if overlap <= 0:
+            continue
+        scored.append(
+            {
+                "id": row.get("id") or f"security-help-{i}",
+                "question": q,
+                "answer": a,
+                "score": float(overlap) / max(len(q_tokens), 1),
+                "text": full,
+            }
+        )
+
+    scored.sort(key=lambda x: x.get("score", 0.0), reverse=True)
+    return scored[:k]
+
+
+def _answer_security_howto(user_text: str, llm: ChatOpenAI) -> Optional[Dict[str, Any]]:
+    snippets = _retrieve_security_help(user_text, k=3)
+    if not snippets:
+        return None
+    if snippets[0].get("score", 0.0) < 0.2:
+        return None
+
+    context_parts = []
+    for s in snippets:
+        context_parts.append(
+            f"[{s.get('id')}]\n"
+            f"Q: {s.get('question')}\n"
+            f"A: {s.get('answer')}"
+        )
+    context = "\n\n".join(context_parts)
+
+    prompt = (
+        "You are a security support assistant in a live chat.\n"
+        "Answer the user's procedural question using only the provided snippets.\n"
+        "Do not invent product-specific UI labels beyond snippet wording.\n"
+        "Be concise and provide clear steps.\n"
+        "If snippets are insufficient, say you don't have enough detail and suggest contacting support.\n"
+        "Cite snippet ids in brackets (for example: [sec-help-003]).\n\n"
+        f"USER QUESTION:\n{user_text}\n\n"
+        f"SNIPPETS:\n{context}"
+    )
+
+    try:
+        msg = str(llm.invoke(prompt).content).strip()
+    except Exception:
+        top = snippets[0]
+        msg = f"{top.get('answer', '')} [{top.get('id')}]".strip()
+    if not msg:
+        return None
+    return {"message": msg, "snippets": snippets}
 
 
 def _read_security_events(member_id: str, timeframe: Timeframe, max_events: int = 5) -> List[Dict[str, Any]]:
@@ -230,6 +420,28 @@ def _respond_node(state: SecurityState, llm: ChatOpenAI) -> SecurityState:
     user_text = state.get("user_text", "")
     recognized = _user_says_recognized(user_text)
     not_recognized = _user_says_not_recognized(user_text)
+    asks_howto = _user_asks_security_howto(user_text)
+
+    if asks_howto:
+        rag = _answer_security_howto(user_text, llm)
+        if rag:
+            help_msg = rag["message"]
+            if not_recognized:
+                msg = (
+                    "Because you do not recognize the login, take these actions now:\n"
+                    f"- {actions[1]}\n"
+                    f"- {actions[2] if len(actions) > 2 else 'Enable MFA for added protection.'}\n\n"
+                    f"{help_msg}"
+                )
+            else:
+                msg = help_msg
+            return {
+                "response_text": msg,
+                "follow_up_question": None,
+                "recommended_actions": actions,
+                "latest_event": latest,
+                "security_help_snippets": rag.get("snippets", []),
+            }
 
     try:
         if not_recognized:
@@ -281,6 +493,7 @@ def _respond_node(state: SecurityState, llm: ChatOpenAI) -> SecurityState:
         "follow_up_question": follow_up,
         "recommended_actions": actions,
         "latest_event": latest,
+        "security_help_snippets": [],
     }
 
 
@@ -349,6 +562,7 @@ def run_membership_fraud_story1(req: StoryRequest) -> StoryResult:
         "retrieved_events": retrieved_events,
         "recommended_actions": state_out.get("recommended_actions", []),
         "latest_event": state_out.get("latest_event"),
+        "security_help_snippets": state_out.get("security_help_snippets", []),
     }
 
     return StoryResult(
