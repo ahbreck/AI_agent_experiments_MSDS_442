@@ -16,6 +16,7 @@ from ..utils import extract_explicit_member_id, normalize_campaign_id, parse_las
 
 PROJECT_PHASE_2 = Path(__file__).resolve().parents[2]
 DB_PATH = PROJECT_PHASE_2 / "kb" / "BusinessMarketing" / "brand_feedback.db"
+LOW_DATA_THRESHOLD = 15
 
 
 class FeedbackFilters(BaseModel):
@@ -56,6 +57,8 @@ class FeedbackGraphState(TypedDict, total=False):
     aggregation: Dict[str, Any]
     focus_themes: List[str]
     adjustments: List[Dict[str, Any]]
+    route_mode: str
+    data_quality: Dict[str, Any]
     response_text: str
     follow_up_question: Optional[str]
 
@@ -215,6 +218,24 @@ def _focus_node(state: FeedbackGraphState) -> FeedbackGraphState:
     return {"focus_themes": focus}
 
 
+def _route_node(state: FeedbackGraphState) -> FeedbackGraphState:
+    agg = state.get("aggregation", {})
+    total_n = int(agg.get("total_n", 0))
+    if total_n == 0:
+        mode = "no_data"
+    elif total_n < LOW_DATA_THRESHOLD:
+        mode = "low_data"
+    else:
+        mode = "normal"
+    return {
+        "route_mode": mode,
+        "data_quality": {
+            "total_n": total_n,
+            "low_data_threshold": LOW_DATA_THRESHOLD,
+        },
+    }
+
+
 def _recommend_node(state: FeedbackGraphState, llm: ChatOpenAI) -> FeedbackGraphState:
     themes = state.get("aggregation", {}).get("themes", [])
     if not themes:
@@ -246,13 +267,32 @@ def _format_node(state: FeedbackGraphState) -> FeedbackGraphState:
     agg = state.get("aggregation", {})
     themes = agg.get("themes", [])
     adjustments = state.get("adjustments", [])
+    route_mode = state.get("route_mode") or "normal"
 
-    if not themes:
+    if route_mode == "no_data" or not themes:
         text = (
             "No feedback matched those filters. "
             "Try widening the date range, removing channel filters, or omitting campaign_ids."
         )
         return {"response_text": text, "follow_up_question": None}
+    if route_mode == "low_data":
+        lines = [
+            "Brand Manager Feedback Themes Summary (Limited Sample)",
+            f"Date range: {filters.start_date}..{filters.end_date} ({filters.timeframe_label})",
+            f"Rows analyzed: {agg.get('total_n', len(rows))} (low confidence; target >= {LOW_DATA_THRESHOLD})",
+            "Top themes (provisional):",
+        ]
+        for t in themes[:2]:
+            lines.append(
+                f"- {t['theme']}: n={t['n']}, share={t['share']}, neg={t['neg_share']}, pos={t['pos_share']}, salience={t['salience']}"
+            )
+        follow_up = (
+            "Would you like me to widen the window to the last 8 weeks, "
+            "or include all channels/campaigns to improve confidence?"
+        )
+        lines.append("")
+        lines.append("I can provide stronger recommendations after expanding scope.")
+        return {"response_text": "\n".join(lines), "follow_up_question": follow_up}
 
     lines = [
         "Brand Manager Feedback Themes Summary",
@@ -282,14 +322,19 @@ def _build_story_graph():
     g.add_node("parse", _parse_node)
     g.add_node("retrieve", _retrieve_node)
     g.add_node("aggregate", _aggregate_node)
+    g.add_node("route", _route_node)
     g.add_node("focus", _focus_node)
     g.add_node("recommend", recommend_node)
     g.add_node("format", _format_node)
 
+    def route_after_route(state: FeedbackGraphState) -> str:
+        return state.get("route_mode") or "normal"
+
     g.set_entry_point("parse")
     g.add_edge("parse", "retrieve")
     g.add_edge("retrieve", "aggregate")
-    g.add_edge("aggregate", "focus")
+    g.add_edge("aggregate", "route")
+    g.add_conditional_edges("route", route_after_route, {"no_data": "format", "low_data": "format", "normal": "focus"})
     g.add_edge("focus", "recommend")
     g.add_edge("recommend", "format")
     g.add_edge("format", END)
@@ -317,6 +362,8 @@ def run_business_marketing_story1(req: StoryRequest) -> StoryResult:
     agg = state_out.get("aggregation", {"total_n": 0, "themes": []})
     focus = state_out.get("focus_themes", [])
     adjustments = state_out.get("adjustments", [])
+    route_mode = state_out.get("route_mode", "normal")
+    data_quality = state_out.get("data_quality", {})
     text = state_out.get("response_text", "I can summarize campaign feedback.")
 
     return StoryResult(
@@ -329,6 +376,8 @@ def run_business_marketing_story1(req: StoryRequest) -> StoryResult:
             "aggregation": agg,
             "focus_themes": focus,
             "adjustments": adjustments,
+            "route_mode": route_mode,
+            "data_quality": data_quality,
             "generated_on": date.today().isoformat(),
         },
         state_updates_domain={"last_story_summary": f"Analyzed {agg.get('total_n', 0)} feedback rows."},
