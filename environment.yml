@@ -26,6 +26,7 @@ dependencies:
 
   # pip-installed packages
   - pip:
+      - "pydantic>=2.11,<2.12"
       - openai
       - langchain
       - langchain-openai

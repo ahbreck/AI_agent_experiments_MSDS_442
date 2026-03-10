@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import asdict
 import os
+import warnings
 from typing import Any, Dict, List, Optional, Tuple, TypedDict
 
 try:
@@ -18,6 +19,14 @@ from pydantic import BaseModel, Field
 from .catalog import DOMAIN_TO_STORIES, STORY_CATALOG
 from .contracts import CanonicalMember, GlobalState, RouteDecision, StoryRequest, StoryResult
 from .utils import extract_explicit_member_id
+
+# Suppress known noisy structured-output serializer warning from dependency internals.
+warnings.filterwarnings(
+    "ignore",
+    message=r"Pydantic serializer warnings:.*field_name='parsed'.*",
+    category=UserWarning,
+    module=r"pydantic\.main",
+)
 
 
 CONT_HIGH = 0.70
