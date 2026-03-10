@@ -1,0 +1,33 @@
+# Project Phase 2 Prototype (3 stories wired thus far)
+
+## Features
+- Top-level operator router (domain routing)
+- In-domain story router
+- Layered state (`GlobalState` + per-domain context)
+- Memory checkpointer (`MemorySaver`) keyed by `thread_id` for multi-user simulation
+- 3 working story handlers:
+  - `bm_story_1`
+  - `ds_story_2`
+  - `mf_story_1`
+- Catalog-driven structure for adding the remaining 6 stories
+
+## Run
+From `Project_Phase_2`:
+
+```powershell
+python .\prototype_cli.py
+```
+
+You can also test the agentic application from the notebook wrapper:
+
+`Prototype_Orchestrator_Wrapper.ipynb`
+
+
+## Add a new future story
+1. Add a handler in `prototype/stories/`.
+2. Register it in `prototype/catalog.py` (`STORY_CATALOG` and `DOMAIN_TO_STORIES`).
+3. Keep handler signature: `StoryRequest -> StoryResult`.
+
+## Multi-user threads
+- Use `orchestrator.invoke(query, thread_id=\"user_a\")`.
+- Different `thread_id` values maintain separate state snapshots in `MemorySaver`.

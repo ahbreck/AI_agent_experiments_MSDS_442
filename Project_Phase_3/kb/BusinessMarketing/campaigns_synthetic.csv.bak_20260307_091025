@@ -1,0 +1,19 @@
+campaign_id,campaign_name,objective,primary_channel,launch_date
+CAMP_100,Momentum Drive,acquisition,email,2026-01-23
+CAMP_101,Momentum Push,retention,app,2025-12-04
+CAMP_102,Spring Push,acquisition,web,2026-01-28
+CAMP_103,Peak Wave,retention,app,2025-11-14
+CAMP_104,Member Boost,retention,web,2025-11-06
+CAMP_105,Member Boost,engagement,email,2026-01-17
+CAMP_106,Member Drive,engagement,app,2025-12-16
+CAMP_107,Spring Drive,acquisition,web,2025-11-16
+CAMP_108,Momentum Boost,engagement,email,2025-12-17
+CAMP_109,Spring Wave,acquisition,web,2026-01-10
+CAMP_110,Momentum Push,engagement,app,2025-12-10
+CAMP_111,Spring Pulse,retention,social,2025-11-08
+CAMP_112,New Drive,conversion,social,2025-11-15
+CAMP_113,Member Drive,engagement,social,2025-11-23
+CAMP_114,Peak Pulse,acquisition,app,2026-01-31
+CAMP_115,Power Wave,conversion,web,2025-11-23
+CAMP_116,Member Push,engagement,email,2025-12-01
+CAMP_117,Spring Pulse,conversion,social,2025-12-13
