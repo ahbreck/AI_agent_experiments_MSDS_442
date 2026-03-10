@@ -19,6 +19,17 @@ AVAILABLE_GROUPINGS = ["campaign_id", "channel", "target_segment", "week_start"]
 PLAUSIBLE_CTR_MIN = 0.0
 PLAUSIBLE_CTR_MAX = 1.0
 INTENT_TYPES = ["underperformers_only", "compare_metrics", "overview", "definitions"]
+DEFAULT_THRESHOLD_ROWS = [
+    ("click_through_rate", "min", 0.050, None, None, None, None, 0, "Global baseline"),
+    ("customer_acquisition_cost", "max", 65.0, None, None, None, None, 0, "Global baseline"),
+    ("return_on_ad_spend", "min", 3.0, None, None, None, None, 0, "Global baseline"),
+    ("click_through_rate", "min", 0.055, "email", None, None, None, 10, "Email benchmark"),
+    ("click_through_rate", "min", 0.048, "social", None, None, None, 10, "Social benchmark"),
+    ("customer_acquisition_cost", "max", 70.0, None, "new_prospects", None, None, 10, "Acquisition-heavy segment"),
+    ("return_on_ad_spend", "min", 3.1, None, "active_members", None, None, 10, "Retention-heavy segment"),
+    ("return_on_ad_spend", "min", 3.15, None, None, "retention", None, 10, "Retention objective"),
+    ("customer_acquisition_cost", "max", 72.0, None, None, "acquisition", None, 10, "Acquisition objective"),
+]
 
 METRIC_META = {
     "click_through_rate": {"label": "CTR", "value_key": "avg_ctr", "delta_key": "delta_ctr"},
@@ -61,30 +72,53 @@ def _ensure_threshold_table(conn: sqlite3.Connection) -> None:
         )
         """
     )
-    existing = conn.execute("SELECT COUNT(*) FROM campaign_metric_thresholds").fetchone()[0]
-    if existing:
-        return
-
-    # Defaults first; optional overrides can specialize by channel/segment/objective/campaign.
-    seed_rows = [
-        ("click_through_rate", "min", 0.035, None, None, None, None, 0, "Global baseline"),
-        ("customer_acquisition_cost", "max", 80.0, None, None, None, None, 0, "Global baseline"),
-        ("return_on_ad_spend", "min", 2.5, None, None, None, None, 0, "Global baseline"),
-        ("click_through_rate", "min", 0.040, "email", None, None, None, 10, "Email benchmark"),
-        ("click_through_rate", "min", 0.030, "social", None, None, None, 10, "Social benchmark"),
-        ("customer_acquisition_cost", "max", 88.0, None, "new_prospects", None, None, 10, "Acquisition-heavy segment"),
-        ("return_on_ad_spend", "min", 2.7, None, "active_members", None, None, 10, "Retention-heavy segment"),
-        ("return_on_ad_spend", "min", 2.8, None, None, "retention", None, 10, "Retention objective"),
-        ("customer_acquisition_cost", "max", 90.0, None, None, "acquisition", None, 10, "Acquisition objective"),
-    ]
-    conn.executemany(
-        """
-        INSERT INTO campaign_metric_thresholds (
-            metric, threshold_type, threshold_value, channel, target_segment, objective, campaign_id, priority, note
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """,
-        seed_rows,
-    )
+    # Keep defaults calibrated across runs while preserving any user-added custom rows.
+    for seed in DEFAULT_THRESHOLD_ROWS:
+        metric, threshold_type, threshold_value, channel, target_segment, objective, campaign_id, priority, note = seed
+        existing = conn.execute(
+            """
+            SELECT threshold_id
+            FROM campaign_metric_thresholds
+            WHERE metric = ?
+              AND threshold_type = ?
+              AND IFNULL(channel, '') = IFNULL(?, '')
+              AND IFNULL(target_segment, '') = IFNULL(?, '')
+              AND IFNULL(objective, '') = IFNULL(?, '')
+              AND IFNULL(campaign_id, '') = IFNULL(?, '')
+              AND IFNULL(note, '') = IFNULL(?, '')
+            ORDER BY threshold_id DESC
+            LIMIT 1
+            """,
+            (metric, threshold_type, channel, target_segment, objective, campaign_id, note),
+        ).fetchone()
+        if existing:
+            conn.execute(
+                """
+                UPDATE campaign_metric_thresholds
+                SET threshold_value = ?, priority = ?
+                WHERE threshold_id = ?
+                """,
+                (threshold_value, priority, int(existing[0])),
+            )
+        else:
+            conn.execute(
+                """
+                INSERT INTO campaign_metric_thresholds (
+                    metric, threshold_type, threshold_value, channel, target_segment, objective, campaign_id, priority, note
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    metric,
+                    threshold_type,
+                    threshold_value,
+                    channel,
+                    target_segment,
+                    objective,
+                    campaign_id,
+                    priority,
+                    note,
+                ),
+            )
 
 
 def _get_available_weeks(conn: sqlite3.Connection) -> List[str]:
