@@ -519,9 +519,20 @@ def consult_thresholds(conn: sqlite3.Connection, context: Dict[str, Optional[str
 
 def explain_metric_defs() -> Dict[str, str]:
     return {
-        "CTR": "Click-through rate. Here it is read directly from weekly_campaign_metrics.click_through_rate.",
-        "CAC": "Customer acquisition cost. Here it is read directly from weekly_campaign_metrics.customer_acquisition_cost.",
-        "ROAS": "Return on ad spend. Here it is read directly from weekly_campaign_metrics.return_on_ad_spend.",
+        "CTR": (
+            "Click-through rate (CTR) measures how often people click an ad after seeing it. "
+            "In this dataset it is read from weekly_campaign_metrics.click_through_rate."
+        ),
+        "CAC": (
+            "Customer acquisition cost (CAC) measures how much it costs to acquire one new customer, "
+            "computed as total spend divided by the number of new customers. "
+            "In this dataset it is read from weekly_campaign_metrics.customer_acquisition_cost."
+        ),
+        "ROAS": (
+            "Return on ad spend (ROAS) measures revenue generated for every dollar spent on advertising. "
+            "Revenue is in the numerator and spend is in the denominator of the equation. "
+            "In this dataset it is read from weekly_campaign_metrics.return_on_ad_spend."
+        ),
         "Spend": "Weekly campaign spend from weekly_campaign_metrics.spend.",
     }
 
@@ -766,11 +777,6 @@ def _format_response(payload: Dict[str, Any]) -> str:
             f"(invalid CTR={quality['invalid_ctr_rows']}, null CAC={quality['null_cac_rows']}, null ROAS={quality['null_roas_rows']})."
         )
 
-    if intent in {"overview", "underperformers_only"} and (under or not concise):
-        lines.append("Suggested next checks (hypotheses, not confirmed causes):")
-        lines.append("- Creative fatigue: inspect weekly creative-level CTR trend by channel.")
-        lines.append("- Targeting mismatch: compare response by target_segment and objective alignment.")
-        lines.append("- Budget allocation: check if spend is concentrated in lower-ROAS groups.")
     return "\n".join(lines)
 
 
