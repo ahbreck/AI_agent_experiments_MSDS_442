@@ -5,9 +5,11 @@ import sqlite3
 from collections import defaultdict
 from datetime import date, datetime, timedelta
 from pathlib import Path
-from typing import Any, Dict, List, Literal, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Literal, Optional, Sequence, Tuple, TypedDict
 
 from langchain_openai import ChatOpenAI
+from langchain_core.runnables.graph_mermaid import MermaidDrawMethod
+from langgraph.graph import END, StateGraph
 from pydantic import BaseModel, Field
 from ..contracts import StoryRequest, StoryResult
 from ..utils import normalize_campaign_id
@@ -37,6 +39,8 @@ METRIC_META = {
     "return_on_ad_spend": {"label": "ROAS", "value_key": "avg_roas", "delta_key": "delta_roas"},
     "spend": {"label": "Spend", "value_key": "total_spend", "delta_key": "delta_spend"},
 }
+
+BUSINESS_MARKETING_STORY2_GRAPH = None
 
 
 class IntentClassifierOutput(BaseModel):
@@ -911,3 +915,50 @@ def run_business_marketing_story2(req: StoryRequest) -> StoryResult:
             )
         },
     )
+
+
+def get_business_marketing_story2_mermaid() -> str:
+    return _get_business_marketing_story2_graph().get_graph().draw_mermaid()
+
+
+class Story2GraphState(TypedDict, total=False):
+    user_query: str
+
+
+def _get_business_marketing_story2_graph():
+    global BUSINESS_MARKETING_STORY2_GRAPH
+    if BUSINESS_MARKETING_STORY2_GRAPH is not None:
+        return BUSINESS_MARKETING_STORY2_GRAPH
+
+    g = StateGraph(Story2GraphState)
+
+    def passthrough(state: Story2GraphState) -> Story2GraphState:
+        return state
+
+    g.add_node("classify_intent", passthrough)
+    g.add_node("extract_scope", passthrough)
+    g.add_node("read_metrics", passthrough)
+    g.add_node("aggregate", passthrough)
+    g.add_node("quality_checks", passthrough)
+    g.add_node("threshold_eval", passthrough)
+    g.add_node("format_response", passthrough)
+
+    g.set_entry_point("classify_intent")
+    g.add_edge("classify_intent", "extract_scope")
+    g.add_edge("extract_scope", "read_metrics")
+    g.add_edge("read_metrics", "aggregate")
+    g.add_edge("aggregate", "quality_checks")
+    g.add_edge("quality_checks", "threshold_eval")
+    g.add_edge("threshold_eval", "format_response")
+    g.add_edge("format_response", END)
+
+    BUSINESS_MARKETING_STORY2_GRAPH = g.compile()
+    return BUSINESS_MARKETING_STORY2_GRAPH
+
+
+def get_business_marketing_story2_mermaid_png() -> bytes:
+    graph = _get_business_marketing_story2_graph().get_graph()
+    try:
+        return graph.draw_mermaid_png(draw_method=MermaidDrawMethod.PYPPETEER)
+    except Exception:
+        return graph.draw_mermaid_png()
