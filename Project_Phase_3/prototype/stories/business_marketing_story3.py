@@ -24,6 +24,10 @@ DEFAULT_TONE = "consultative"
 DEFAULT_RECENCY_BONUS_BASE = 10.0
 VALID_CHANNELS = {"email", "call", "sms"}
 VALID_TONES = {"friendly", "consultative", "urgent", "neutral"}
+INFER_ACCEPT_CONFIDENCE = 0.90
+INFER_CLARIFY_CONFIDENCE = 0.65
+CARRY_FORWARD_MAX_USER_TURN_GAP = 3
+STORY3_STATE_KEY = "bm_story_3_state"
 BUSINESS_MARKETING_STORY3_GRAPH = None
 
 
@@ -33,6 +37,12 @@ class LeadPlanningOutput(BaseModel):
     channel: Optional[str] = Field(default=None)
     tone: Optional[str] = Field(default=None)
     primary_class_interest: List[str] = Field(default_factory=list)
+    lookback_confidence: Optional[float] = Field(default=None)
+    channel_confidence: Optional[float] = Field(default=None)
+    interest_confidence: Optional[float] = Field(default=None)
+    lookback_evidence: Optional[str] = Field(default=None)
+    channel_evidence: Optional[str] = Field(default=None)
+    interest_evidence: Optional[str] = Field(default=None)
     assumptions: List[str] = Field(default_factory=list)
     rationale: str = Field(default="")
 
@@ -106,6 +116,174 @@ def _parse_interest_filters(user_text: str) -> Optional[List[str]]:
     return dedup
 
 
+def _query_has_explicit_lookback(user_text: str) -> bool:
+    text = user_text.lower()
+    if re.search(r"\blast\s+(\d{1,3})\s+days?\b", text):
+        return True
+    return any(phrase in text for phrase in ("this week", "current week", "latest week", "last two weeks", "last month"))
+
+
+def _query_has_explicit_channel(user_text: str) -> bool:
+    text = user_text.lower()
+    return bool(re.search(r"\b(email|e-mail|call|phone|sms|text)\b", text))
+
+
+def _query_has_explicit_interest(user_text: str) -> bool:
+    text = user_text.lower()
+    return bool(re.search(r"\b(cycling|yoga|strength|running)\b", text))
+
+
+def _query_has_explicit_top_n(user_text: str) -> bool:
+    return re.search(r"\btop\s+(\d{1,3})\b", user_text.lower()) is not None
+
+
+def _query_has_explicit_tone(user_text: str) -> bool:
+    text = user_text.lower()
+    return any(re.search(rf"\b{tone}\b", text) for tone in VALID_TONES)
+
+
+def _user_turn_number(messages: Sequence[Dict[str, Any]]) -> int:
+    return sum(1 for m in messages if str(m.get("role", "")).lower() == "user")
+
+
+def _is_refinement_like_query(user_text: str) -> bool:
+    text = user_text.lower()
+    refinement_terms = {
+        "change",
+        "update",
+        "adjust",
+        "refine",
+        "switch",
+        "instead",
+        "use",
+        "set",
+        "make",
+        "now",
+        "only",
+        "keep",
+        "same",
+        "show top",
+        "tone",
+        "top ",
+    }
+    shift_terms = {
+        "campaign",
+        "ctr",
+        "cac",
+        "roas",
+        "spend",
+        "sentiment",
+        "theme",
+        "fraud",
+        "security",
+        "login",
+        "workout",
+        "heart rate",
+        "zone",
+        "cadence",
+        "member_id",
+    }
+    has_refinement = any(term in text for term in refinement_terms)
+    has_shift = any(term in text for term in shift_terms)
+    return has_refinement and not has_shift
+
+
+def _clear_clarification_for_field(plan: Dict[str, Any], field_name: str) -> None:
+    unresolved = [f for f in list(plan.get("unresolved_fields", [])) if f != field_name]
+    plan["unresolved_fields"] = unresolved
+    plan["needs_clarification"] = bool(unresolved)
+
+    parts: List[str] = []
+    if "lookback_days" in unresolved:
+        parts.append("timeframe (7, 14, or 30 days)")
+    if "channel" in unresolved:
+        parts.append("outreach channel (email, call, or sms)")
+    if "primary_class_interest" in unresolved:
+        parts.append("interest focus (Cycling, Yoga, Strength, Running, or all)")
+    plan["clarification_question"] = ("Please confirm " + " and ".join(parts) + ".") if parts else None
+
+
+def _merge_with_prior_plan(
+    plan: Dict[str, Any],
+    prior_story3_state: Optional[Dict[str, Any]],
+    user_text: str,
+    user_turn_number: int,
+) -> Dict[str, Any]:
+    if not prior_story3_state:
+        return plan
+    prior_plan = prior_story3_state.get("last_resolved_plan")
+    if not isinstance(prior_plan, dict):
+        return plan
+
+    prior_turn = int(prior_story3_state.get("last_user_turn_number", 0) or 0)
+    turn_gap = max(0, user_turn_number - prior_turn)
+    if turn_gap > CARRY_FORWARD_MAX_USER_TURN_GAP:
+        return plan
+    if not _is_refinement_like_query(user_text):
+        return plan
+
+    out = dict(plan)
+    out["assumptions"] = list(out.get("assumptions", []))
+    out["field_resolution"] = dict(out.get("field_resolution", {}))
+
+    explicit_lookback = _query_has_explicit_lookback(user_text)
+    explicit_channel = _query_has_explicit_channel(user_text)
+    explicit_interest = _query_has_explicit_interest(user_text)
+    explicit_top_n = _query_has_explicit_top_n(user_text)
+    explicit_tone = _query_has_explicit_tone(user_text)
+
+    carried_fields: List[str] = []
+
+    def _drop_assumptions(containing: Sequence[str]) -> None:
+        out["assumptions"] = [
+            a
+            for a in out.get("assumptions", [])
+            if not any(token in a.lower() for token in containing)
+        ]
+
+    def carry(field_name: str, value: Any) -> None:
+        out[field_name] = value
+        fr = dict(out.get("field_resolution", {}).get(field_name, {}))
+        fr["source"] = "carried_forward"
+        fr["confidence"] = round(float(fr.get("confidence", 0.0) or 0.0), 2)
+        fr["evidence"] = (
+            "Carried forward from prior bm_story_3 plan in this thread due to refinement-style query."
+        )
+        out["field_resolution"][field_name] = fr
+        carried_fields.append(field_name)
+        _clear_clarification_for_field(out, field_name)
+
+    if not explicit_lookback and "lookback_days" in prior_plan:
+        carry("lookback_days", int(prior_plan["lookback_days"]))
+    if not explicit_channel and "channel" in prior_plan:
+        carry("channel", str(prior_plan["channel"]))
+    if not explicit_interest and "primary_class_interest" in prior_plan:
+        out["primary_class_interest"] = prior_plan["primary_class_interest"]
+        carry("primary_class_interest", prior_plan["primary_class_interest"])
+
+    if not explicit_top_n and "top_n" in prior_plan:
+        out["top_n"] = int(prior_plan["top_n"])
+        out["assumptions"].append("Carried forward top_n from previous bm_story_3 turn.")
+    if not explicit_tone and "tone" in prior_plan:
+        out["tone"] = str(prior_plan["tone"])
+        out["assumptions"].append("Carried forward tone from previous bm_story_3 turn.")
+
+    # Ensure assumptions are consistent with carried-forward resolution.
+    if "lookback_days" in carried_fields:
+        _drop_assumptions(("no timeframe provided; defaulted", "inferred lookback="))
+        out["assumptions"].append("Carried forward lookback_days from previous bm_story_3 turn.")
+    if "channel" in carried_fields:
+        _drop_assumptions(("no outreach channel provided; defaulted", "inferred channel='"))
+        out["assumptions"].append("Carried forward channel from previous bm_story_3 turn.")
+    if "primary_class_interest" in carried_fields:
+        _drop_assumptions(("inferred primary_class_interest=",))
+        out["assumptions"].append("Carried forward primary_class_interest from previous bm_story_3 turn.")
+
+    if out.get("needs_clarification") is False:
+        out["follow_up_question"] = None
+    return out
+
+
 def _deterministic_request_plan(user_text: str) -> Dict[str, Any]:
     top_n = _parse_top_n(user_text)
     lookback_days, lookback_assumption = _parse_lookback_days(user_text)
@@ -132,6 +310,8 @@ def _llm_request_plan(user_text: str) -> Optional[LeadPlanningOutput]:
         "Allowed channel: email, call, sms.\n"
         "Allowed tone: friendly, consultative, urgent, neutral.\n"
         "Allowed interests: Cycling, Yoga, Strength, Running.\n"
+        "For lookback/channel/interest include confidence scores from 0.0 to 1.0.\n"
+        "Include short evidence strings for lookback/channel/interest.\n"
         "If the user is ambiguous, set sensible defaults and include assumptions.\n"
         "Return only structured output."
     )
@@ -171,34 +351,160 @@ def _resolve_request_plan(user_text: str) -> Dict[str, Any]:
     assumptions = list(deterministic["assumptions"])
     for item in llm_plan.assumptions:
         txt = str(item or "").strip()
-        if txt and txt not in assumptions:
+        if not txt:
+            continue
+        low = txt.lower()
+        if any(term in low for term in ("based on recent engagement", "based on previous", "effective", "most responsive", "past interactions", "recent trends", "lead behavior")):
+            continue
+        if txt not in assumptions:
             assumptions.append(txt)
+
+    explicit_lookback = _query_has_explicit_lookback(user_text)
+    explicit_channel = _query_has_explicit_channel(user_text)
+    explicit_interest = _query_has_explicit_interest(user_text)
+
+    def _safe_conf(v: Optional[float]) -> float:
+        if v is None:
+            return 0.0
+        try:
+            return max(0.0, min(1.0, float(v)))
+        except Exception:
+            return 0.0
 
     raw_top_n = llm_plan.top_n if llm_plan.top_n is not None else deterministic["top_n"]
     top_n = max(1, min(100, int(raw_top_n)))
 
     raw_lookback = llm_plan.lookback_days if llm_plan.lookback_days is not None else deterministic["lookback_days"]
-    if int(raw_lookback) in VALID_LOOKBACKS:
+    lookback_conf = _safe_conf(llm_plan.lookback_confidence)
+    if explicit_lookback and int(raw_lookback) in VALID_LOOKBACKS:
         lookback_days = int(raw_lookback)
-    else:
+        lookback_source = "explicit"
+    elif explicit_lookback:
         lookback_days = _closest_lookback(int(raw_lookback))
+        lookback_source = "explicit_coerced"
         assumptions.append(
             f"Requested/parsed lookback {int(raw_lookback)} is unsupported; mapped to {lookback_days} days."
         )
+    elif llm_plan.lookback_days is not None and lookback_conf >= INFER_ACCEPT_CONFIDENCE:
+        candidate = int(raw_lookback)
+        lookback_days = candidate if candidate in VALID_LOOKBACKS else _closest_lookback(candidate)
+        lookback_source = "inferred"
+        assumptions.append(
+            f"Inferred lookback={lookback_days} days from query ambiguity (confidence={lookback_conf:.2f})."
+        )
+        if candidate not in VALID_LOOKBACKS:
+            assumptions.append(
+                f"Inferred lookback {candidate} is unsupported; mapped to {lookback_days} days."
+            )
+    elif llm_plan.lookback_days is not None and lookback_conf >= INFER_CLARIFY_CONFIDENCE:
+        lookback_days = int(deterministic["lookback_days"])
+        lookback_source = "default_pending_clarification"
+    else:
+        lookback_days = int(deterministic["lookback_days"])
+        lookback_source = "default"
 
     raw_channel = str(llm_plan.channel or deterministic["channel"]).strip().lower()
-    channel = raw_channel if raw_channel in VALID_CHANNELS else deterministic["channel"]
-    if raw_channel not in VALID_CHANNELS:
-        assumptions.append(f"Unsupported channel '{raw_channel}' detected; defaulted to {channel}.")
+    channel_conf = _safe_conf(llm_plan.channel_confidence)
+    if explicit_channel:
+        channel = raw_channel if raw_channel in VALID_CHANNELS else deterministic["channel"]
+        channel_source = "explicit"
+        if raw_channel not in VALID_CHANNELS:
+            channel_source = "explicit_coerced"
+            assumptions.append(f"Unsupported channel '{raw_channel}' detected; defaulted to {channel}.")
+    elif llm_plan.channel and raw_channel in VALID_CHANNELS and channel_conf >= INFER_ACCEPT_CONFIDENCE:
+        channel = raw_channel
+        channel_source = "inferred"
+        assumptions.append(f"Inferred channel='{channel}' from query ambiguity (confidence={channel_conf:.2f}).")
+    elif llm_plan.channel and channel_conf >= INFER_CLARIFY_CONFIDENCE:
+        channel = str(deterministic["channel"])
+        channel_source = "default_pending_clarification"
+    else:
+        channel = str(deterministic["channel"])
+        channel_source = "default"
 
     raw_tone = str(llm_plan.tone or deterministic["tone"]).strip().lower()
     tone = raw_tone if raw_tone in VALID_TONES else deterministic["tone"]
     if raw_tone not in VALID_TONES:
         assumptions.append(f"Unsupported tone '{raw_tone}' detected; defaulted to {tone}.")
 
+    interest_conf = _safe_conf(llm_plan.interest_confidence)
     interests = _normalize_interest_values(llm_plan.primary_class_interest)
-    if interests is None:
+    if explicit_interest:
+        interest_source = "explicit"
+        if interests is None:
+            interests = deterministic["primary_class_interest"]
+            interest_source = "explicit_unresolved"
+    elif interests and interest_conf >= INFER_ACCEPT_CONFIDENCE:
+        interest_source = "inferred"
+        assumptions.append(
+            f"Inferred primary_class_interest={interests} from query ambiguity (confidence={interest_conf:.2f})."
+        )
+    elif interests and interest_conf >= INFER_CLARIFY_CONFIDENCE:
         interests = deterministic["primary_class_interest"]
+        interest_source = "default_pending_clarification"
+    else:
+        interests = deterministic["primary_class_interest"]
+        interest_source = "default"
+
+    unresolved_fields: List[str] = []
+    if lookback_source == "default_pending_clarification":
+        unresolved_fields.append("lookback_days")
+    if channel_source == "default_pending_clarification":
+        unresolved_fields.append("channel")
+    if interest_source == "default_pending_clarification":
+        unresolved_fields.append("primary_class_interest")
+
+    clarification_parts: List[str] = []
+    if "lookback_days" in unresolved_fields:
+        clarification_parts.append("timeframe (7, 14, or 30 days)")
+    if "channel" in unresolved_fields:
+        clarification_parts.append("outreach channel (email, call, or sms)")
+    if "primary_class_interest" in unresolved_fields:
+        clarification_parts.append("interest focus (Cycling, Yoga, Strength, Running, or all)")
+
+    clarification_question = None
+    if clarification_parts:
+        clarification_question = "Please confirm " + " and ".join(clarification_parts) + "."
+
+    # Keep assumptions aligned with the selected resolution for each field.
+    if lookback_source == "inferred":
+        assumptions = [
+            a for a in assumptions if "no timeframe provided; defaulted to last 7 days" not in a.lower()
+        ]
+    if channel_source == "inferred":
+        assumptions = [
+            a for a in assumptions if "no outreach channel provided; defaulted to email" not in a.lower()
+        ]
+
+    # Remove any remaining pseudo-factual assumption text from planner free-form language.
+    assumptions = [
+        a
+        for a in assumptions
+        if not any(
+            term in a.lower()
+            for term in (
+                "based on recent engagement",
+                "based on previous",
+                "past interactions",
+                "recent trends",
+                "lead behavior",
+                "most responsive",
+                "most effective",
+            )
+        )
+    ]
+
+    def _resolution_evidence(field_name: str, source: str) -> str:
+        if source in {"explicit", "explicit_coerced", "explicit_unresolved"}:
+            return f"Detected explicit {field_name} intent in user query text."
+        if source == "inferred":
+            return (
+                f"Inferred {field_name} from ambiguous user wording; "
+                "this is a language-based inference, not a data-derived fact."
+            )
+        if source == "default_pending_clarification":
+            return f"Signal for {field_name} was partially informative; waiting for user confirmation."
+        return f"No reliable signal for {field_name}; deterministic default was applied."
 
     return {
         "top_n": top_n,
@@ -209,6 +515,26 @@ def _resolve_request_plan(user_text: str) -> Dict[str, Any]:
         "assumptions": assumptions,
         "planning_source": "llm_validated",
         "planning_rationale": llm_plan.rationale or "LLM planner output accepted and normalized.",
+        "field_resolution": {
+            "lookback_days": {
+                "source": lookback_source,
+                "confidence": round(lookback_conf, 2),
+                "evidence": _resolution_evidence("lookback_days", lookback_source),
+            },
+            "channel": {
+                "source": channel_source,
+                "confidence": round(channel_conf, 2),
+                "evidence": _resolution_evidence("channel", channel_source),
+            },
+            "primary_class_interest": {
+                "source": interest_source,
+                "confidence": round(interest_conf, 2),
+                "evidence": _resolution_evidence("primary_class_interest", interest_source),
+            },
+        },
+        "needs_clarification": bool(unresolved_fields),
+        "unresolved_fields": unresolved_fields,
+        "clarification_question": clarification_question,
     }
 
 
@@ -535,69 +861,282 @@ def _format_response(
     return "\n".join(lines)
 
 
-def run_business_marketing_story3(req: StoryRequest) -> StoryResult:
-    user_text = req.user_query or ""
-
-    plan = _resolve_request_plan(user_text)
-    top_n = int(plan["top_n"])
-    lookback_days = int(plan["lookback_days"])
-    channel = str(plan["channel"])
-    tone = str(plan["tone"])
+def _build_final_planning_rationale(plan: Dict[str, Any], field_resolution: Dict[str, Any]) -> str:
+    lookback_days = int(plan.get("lookback_days", DEFAULT_LOOKBACK_DAYS))
+    channel = str(plan.get("channel", DEFAULT_CHANNEL))
+    tone = str(plan.get("tone", DEFAULT_TONE))
+    top_n = int(plan.get("top_n", DEFAULT_TOP_N))
     interests = plan.get("primary_class_interest")
-    assumptions = list(plan.get("assumptions", []))
-    planning_source = str(plan.get("planning_source", "deterministic"))
-    planning_rationale = str(plan.get("planning_rationale", ""))
+    interest_text = "all interests" if not interests else ", ".join([str(x) for x in interests])
 
+    def src(field_name: str) -> str:
+        return str((field_resolution.get(field_name, {}) or {}).get("source", "unknown"))
+
+    parts = [
+        f"Resolved request to top_n={top_n}, lookback_days={lookback_days}, channel={channel}, tone={tone}.",
+        f"Interest scope: {interest_text}.",
+        (
+            "Resolution provenance: "
+            f"lookback_days={src('lookback_days')}, "
+            f"channel={src('channel')}, "
+            f"primary_class_interest={src('primary_class_interest')}."
+        ),
+    ]
+    return " ".join(parts)
+
+
+class Story3GraphState(TypedDict, total=False):
+    user_query: str
+    domain_context: Dict[str, Any]
+    user_turn_number: int
+    plan: Dict[str, Any]
+    as_of_date: Optional[str]
+    candidate_rows: List[Dict[str, Any]]
+    scoring_rules: Dict[str, float]
+    suppression_stats: Dict[str, Any]
+    ranked_leads: List[Dict[str, Any]]
+    field_resolution: Dict[str, Any]
+    unresolved_fields: List[str]
+    clarification_question: Optional[str]
+    response_text: str
+    follow_up_question: Optional[str]
+
+
+def _plan_node(state: Story3GraphState) -> Story3GraphState:
+    user_text = str(state.get("user_query", "") or "").strip()
+    if not user_text:
+        ask = (
+            "Please provide what you want prioritized (for example: "
+            "'top 10 leads for last 14 days and draft email follow-ups')."
+        )
+        return {"response_text": ask, "follow_up_question": ask}
+    plan = _resolve_request_plan(user_text)
+    domain_context = state.get("domain_context", {}) or {}
+    prior_story3_state = domain_context.get(STORY3_STATE_KEY)
+    plan = _merge_with_prior_plan(
+        plan=plan,
+        prior_story3_state=prior_story3_state if isinstance(prior_story3_state, dict) else None,
+        user_text=user_text,
+        user_turn_number=int(state.get("user_turn_number", 0) or 0),
+    )
+    if plan.get("needs_clarification") and plan.get("clarification_question"):
+        ask = str(plan["clarification_question"])
+        return {
+            "plan": plan,
+            "field_resolution": dict(plan.get("field_resolution", {})),
+            "unresolved_fields": list(plan.get("unresolved_fields", [])),
+            "clarification_question": ask,
+            "response_text": ask,
+            "follow_up_question": ask,
+        }
+    return {"plan": plan, "follow_up_question": None}
+
+
+def _validate_plan_node(state: Story3GraphState) -> Story3GraphState:
+    raw = dict(state.get("plan", {}))
+    top_n = max(1, min(100, int(raw.get("top_n", DEFAULT_TOP_N))))
+
+    assumptions = list(raw.get("assumptions", []))
+    lookback_days = int(raw.get("lookback_days", DEFAULT_LOOKBACK_DAYS))
+    if lookback_days not in VALID_LOOKBACKS:
+        lookback_days = _closest_lookback(lookback_days)
+        assumptions.append(f"Unsupported lookback normalized to {lookback_days} days.")
+
+    channel = str(raw.get("channel", DEFAULT_CHANNEL)).strip().lower()
+    if channel not in VALID_CHANNELS:
+        assumptions.append(f"Unsupported channel '{channel}' detected; defaulted to {DEFAULT_CHANNEL}.")
+        channel = DEFAULT_CHANNEL
+
+    tone = str(raw.get("tone", DEFAULT_TONE)).strip().lower()
+    if tone not in VALID_TONES:
+        assumptions.append(f"Unsupported tone '{tone}' detected; defaulted to {DEFAULT_TONE}.")
+        tone = DEFAULT_TONE
+
+    interests = raw.get("primary_class_interest")
+    if isinstance(interests, list):
+        interests = _normalize_interest_values(interests)
+    else:
+        interests = None
+
+    raw["top_n"] = top_n
+    raw["lookback_days"] = lookback_days
+    raw["channel"] = channel
+    raw["tone"] = tone
+    raw["primary_class_interest"] = interests
+    raw["assumptions"] = assumptions
+    final_field_resolution = dict(raw.get("field_resolution", state.get("field_resolution", {})))
+    raw["planning_rationale"] = _build_final_planning_rationale(raw, final_field_resolution)
+    return {
+        "plan": raw,
+        "field_resolution": final_field_resolution,
+        "unresolved_fields": list(raw.get("unresolved_fields", state.get("unresolved_fields", []))),
+        "clarification_question": raw.get("clarification_question", state.get("clarification_question")),
+    }
+
+
+def _read_signals_node(state: Story3GraphState) -> Story3GraphState:
+    plan = state["plan"]
     with sqlite3.connect(DB_PATH) as conn:
         as_of_date = _read_as_of_date(conn)
         if not as_of_date:
-            text = "No lead engagement signal data is available yet."
-            return StoryResult(
-                story_id=req.story_id,
-                response_text=text,
-                story_output={"row_count": 0, "generated_on": date.today().isoformat()},
-                state_updates_domain={"last_story_summary": "No lead engagement signal data available."},
-            )
+            msg = "No lead engagement signal data is available yet."
+            return {
+                "as_of_date": None,
+                "candidate_rows": [],
+                "response_text": msg,
+                "suppression_stats": {"candidate_count": 0, "suppressed_excluded_count": 0},
+                "scoring_rules": {},
+                "ranked_leads": [],
+            }
 
-        filters = {"primary_class_interest": interests}
+        filters = {"primary_class_interest": plan.get("primary_class_interest")}
         candidate_rows = read_lead_signals(
             conn,
             filters=filters,
-            recency_window=lookback_days,
+            recency_window=int(plan["lookback_days"]),
             as_of_date=as_of_date,
         )
         scoring_rules = _read_scoring_rules(conn)
+        return {
+            "as_of_date": as_of_date,
+            "candidate_rows": candidate_rows,
+            "scoring_rules": scoring_rules,
+        }
+
+
+def _score_node(state: Story3GraphState) -> Story3GraphState:
+    plan = state["plan"]
+    candidate_rows = state.get("candidate_rows", [])
+    if state.get("response_text"):
+        return {}
+    with sqlite3.connect(DB_PATH) as conn:
         ranked, suppression_stats = score_and_rank_leads(
             conn,
             data=candidate_rows,
-            scoring_rules=scoring_rules,
-            channel=channel,
-            top_n=top_n,
+            scoring_rules=state.get("scoring_rules", {}),
+            channel=str(plan["channel"]),
+            top_n=int(plan["top_n"]),
         )
+    return {"ranked_leads": ranked, "suppression_stats": suppression_stats}
 
+
+def _enrich_drafts_node(state: Story3GraphState) -> Story3GraphState:
+    ranked = list(state.get("ranked_leads", []))
+    if not ranked:
+        return {}
+    plan = state["plan"]
+    with sqlite3.connect(DB_PATH) as conn:
         for lead in ranked:
             intent = infer_intent_from_signals(conn, lead)
             template = select_message_template(
                 conn,
                 intent=intent,
                 primary_class_interest=lead.get("primary_class_interest"),
-                channel=channel,
-                tone=tone,
+                channel=str(plan["channel"]),
+                tone=str(plan["tone"]),
             )
             draft = draft_followup_message(lead, template)
             lead["intent"] = intent
             lead["template_id"] = draft.get("template_id")
             lead["draft_message"] = draft
+    return {"ranked_leads": ranked}
 
-        response_text = _format_response(
-            as_of_date=as_of_date,
-            lookback_days=lookback_days,
-            channel=channel,
-            top_n=top_n,
-            assumptions=assumptions,
-            ranked_leads=ranked,
-            suppression_stats=suppression_stats,
+
+def _format_response_node(state: Story3GraphState) -> Story3GraphState:
+    if state.get("response_text"):
+        return {}
+    plan = state["plan"]
+    as_of_date = state.get("as_of_date")
+    if not as_of_date:
+        msg = "No lead engagement signal data is available yet."
+        return {"response_text": msg}
+    response_text = _format_response(
+        as_of_date=as_of_date,
+        lookback_days=int(plan["lookback_days"]),
+        channel=str(plan["channel"]),
+        top_n=int(plan["top_n"]),
+        assumptions=plan.get("assumptions", []),
+        ranked_leads=state.get("ranked_leads", []),
+        suppression_stats=state.get("suppression_stats", {}),
+    )
+    return {"response_text": response_text}
+
+
+def _route_after_plan(state: Story3GraphState) -> str:
+    return "ask" if state.get("follow_up_question") else "go"
+
+
+def _route_after_read(state: Story3GraphState) -> str:
+    return "done" if state.get("response_text") else "go"
+
+
+def _route_after_score(state: Story3GraphState) -> str:
+    return "format" if not state.get("ranked_leads") else "enrich"
+
+
+def _build_story3_graph():
+    g = StateGraph(Story3GraphState)
+    g.add_node("plan", _plan_node)
+    g.add_node("validate_plan", _validate_plan_node)
+    g.add_node("read_lead_signals", _read_signals_node)
+    g.add_node("score_rank", _score_node)
+    g.add_node("enrich_drafts", _enrich_drafts_node)
+    g.add_node("format_response", _format_response_node)
+    g.set_entry_point("plan")
+    g.add_conditional_edges("plan", _route_after_plan, {"ask": END, "go": "validate_plan"})
+    g.add_edge("validate_plan", "read_lead_signals")
+    g.add_conditional_edges("read_lead_signals", _route_after_read, {"done": END, "go": "score_rank"})
+    g.add_conditional_edges("score_rank", _route_after_score, {"format": "format_response", "enrich": "enrich_drafts"})
+    g.add_edge("enrich_drafts", "format_response")
+    g.add_edge("format_response", END)
+    return g.compile()
+
+
+def _get_business_marketing_story3_graph():
+    global BUSINESS_MARKETING_STORY3_GRAPH
+    if BUSINESS_MARKETING_STORY3_GRAPH is None:
+        BUSINESS_MARKETING_STORY3_GRAPH = _build_story3_graph()
+    return BUSINESS_MARKETING_STORY3_GRAPH
+
+
+def run_business_marketing_story3(req: StoryRequest) -> StoryResult:
+    user_turn = _user_turn_number(req.messages)
+    state_out = _get_business_marketing_story3_graph().invoke(
+        {
+            "user_query": req.user_query or "",
+            "domain_context": req.domain_context or {},
+            "user_turn_number": user_turn,
+        }
+    )
+
+    follow_up = state_out.get("follow_up_question")
+    if follow_up:
+        return StoryResult(
+            story_id=req.story_id,
+            response_text=follow_up,
+            story_output={
+                "needs_request_details": True,
+                "field_resolution": dict(state_out.get("field_resolution", {})),
+                "unresolved_fields": list(state_out.get("unresolved_fields", [])),
+                "clarification_question": state_out.get("clarification_question"),
+            },
+            state_updates_domain={
+                STORY3_STATE_KEY: {
+                    "last_user_turn_number": user_turn,
+                    "last_user_query": req.user_query,
+                    "last_partial_plan": dict(state_out.get("plan", {})),
+                }
+            },
         )
+
+    plan = dict(state_out.get("plan", {}))
+    ranked = list(state_out.get("ranked_leads", []))
+    suppression_stats = dict(state_out.get("suppression_stats", {}))
+    scoring_rules = dict(state_out.get("scoring_rules", {}))
+    as_of_date = state_out.get("as_of_date")
+    response_text = state_out.get("response_text") or "I can prioritize leads and draft outreach follow-ups."
+    lookback_days = int(plan.get("lookback_days", DEFAULT_LOOKBACK_DAYS))
+    channel = str(plan.get("channel", DEFAULT_CHANNEL))
 
     return StoryResult(
         story_id=req.story_id,
@@ -606,12 +1145,14 @@ def run_business_marketing_story3(req: StoryRequest) -> StoryResult:
             "as_of_date": as_of_date,
             "lookback_days": lookback_days,
             "channel": channel,
-            "tone": tone,
-            "top_n": top_n,
-            "filters": {"primary_class_interest": interests},
-            "assumptions": assumptions,
-            "planning_source": planning_source,
-            "planning_rationale": planning_rationale,
+            "tone": str(plan.get("tone", DEFAULT_TONE)),
+            "top_n": int(plan.get("top_n", DEFAULT_TOP_N)),
+            "filters": {"primary_class_interest": plan.get("primary_class_interest")},
+            "assumptions": list(plan.get("assumptions", [])),
+            "planning_source": str(plan.get("planning_source", "deterministic")),
+            "planning_rationale": str(plan.get("planning_rationale", "")),
+            "field_resolution": dict(state_out.get("field_resolution", plan.get("field_resolution", {}))),
+            "unresolved_fields": list(state_out.get("unresolved_fields", plan.get("unresolved_fields", []))),
             "scoring_rules": scoring_rules,
             "candidate_count": suppression_stats.get("candidate_count", 0),
             "suppressed_excluded_count": suppression_stats.get("suppressed_excluded_count", 0),
@@ -622,52 +1163,25 @@ def run_business_marketing_story3(req: StoryRequest) -> StoryResult:
             "last_story_summary": (
                 f"Generated {len(ranked)} prioritized leads "
                 f"for as_of={as_of_date}, lookback={lookback_days}, channel={channel}."
-            )
+            ),
+            STORY3_STATE_KEY: {
+                "last_user_turn_number": user_turn,
+                "last_user_query": req.user_query,
+                "last_resolved_plan": {
+                    "lookback_days": lookback_days,
+                    "channel": channel,
+                    "tone": str(plan.get("tone", DEFAULT_TONE)),
+                    "top_n": int(plan.get("top_n", DEFAULT_TOP_N)),
+                    "primary_class_interest": plan.get("primary_class_interest"),
+                },
+                "field_resolution": dict(state_out.get("field_resolution", plan.get("field_resolution", {}))),
+            },
         },
     )
 
 
 def get_business_marketing_story3_mermaid() -> str:
     return _get_business_marketing_story3_graph().get_graph().draw_mermaid()
-
-
-class Story3GraphState(TypedDict, total=False):
-    user_query: str
-
-
-def _get_business_marketing_story3_graph():
-    global BUSINESS_MARKETING_STORY3_GRAPH
-    if BUSINESS_MARKETING_STORY3_GRAPH is not None:
-        return BUSINESS_MARKETING_STORY3_GRAPH
-
-    g = StateGraph(Story3GraphState)
-
-    def passthrough(state: Story3GraphState) -> Story3GraphState:
-        return state
-
-    g.add_node("llm_plan", passthrough)
-    g.add_node("validate_plan", passthrough)
-    g.add_node("read_lead_signals", passthrough)
-    g.add_node("score_rank", passthrough)
-    g.add_node("suppression_filter", passthrough)
-    g.add_node("infer_intent", passthrough)
-    g.add_node("select_template", passthrough)
-    g.add_node("draft_message", passthrough)
-    g.add_node("format_response", passthrough)
-
-    g.set_entry_point("llm_plan")
-    g.add_edge("llm_plan", "validate_plan")
-    g.add_edge("validate_plan", "read_lead_signals")
-    g.add_edge("read_lead_signals", "score_rank")
-    g.add_edge("score_rank", "suppression_filter")
-    g.add_edge("suppression_filter", "infer_intent")
-    g.add_edge("infer_intent", "select_template")
-    g.add_edge("select_template", "draft_message")
-    g.add_edge("draft_message", "format_response")
-    g.add_edge("format_response", END)
-
-    BUSINESS_MARKETING_STORY3_GRAPH = g.compile()
-    return BUSINESS_MARKETING_STORY3_GRAPH
 
 
 def get_business_marketing_story3_mermaid_png() -> bytes:

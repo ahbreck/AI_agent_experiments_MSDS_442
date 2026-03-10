@@ -13,12 +13,13 @@ from prototype.stories.business_marketing_story3 import run_business_marketing_s
 
 
 class TestBusinessMarketingStory3(unittest.TestCase):
-    def _invoke(self, query: str):
+    def _invoke(self, query: str, messages=None, domain_context=None):
         req = StoryRequest(
             story_id="bm_story_3",
             user_query=query,
-            messages=[],
+            messages=messages or [],
             member=CanonicalMember(),
+            domain_context=domain_context or {},
         )
         return run_business_marketing_story3(req)
 
@@ -65,6 +66,37 @@ class TestBusinessMarketingStory3(unittest.TestCase):
         self.assertIn("draft_message", first)
         self.assertIsInstance(first["draft_message"], dict)
         self.assertIn("body", first["draft_message"])
+
+    def test_refinement_turn_can_carry_forward_missing_fields(self):
+        prior_domain_context = {
+            "bm_story_3_state": {
+                "last_user_turn_number": 1,
+                "last_resolved_plan": {
+                    "lookback_days": 14,
+                    "channel": "email",
+                    "tone": "friendly",
+                    "top_n": 10,
+                    "primary_class_interest": ["Cycling"],
+                },
+                "field_resolution": {
+                    "lookback_days": {"source": "explicit", "confidence": 0.9},
+                    "channel": {"source": "explicit", "confidence": 0.9},
+                    "primary_class_interest": {"source": "explicit", "confidence": 0.9},
+                },
+            }
+        }
+        msgs = [{"role": "user", "content": "Generate top leads and draft follow-ups"}]
+        out = self._invoke(
+            "Make tone consultative and show top 5",
+            messages=msgs,
+            domain_context=prior_domain_context,
+        )
+        payload = out.story_output
+        self.assertNotIn("needs_request_details", payload)
+        self.assertEqual(payload.get("lookback_days"), 14)
+        self.assertEqual(payload.get("channel"), "email")
+        self.assertEqual(payload.get("top_n"), 5)
+        self.assertEqual(payload.get("tone"), "consultative")
 
 
 if __name__ == "__main__":
