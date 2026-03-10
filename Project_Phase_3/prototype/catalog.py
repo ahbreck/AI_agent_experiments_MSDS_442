@@ -5,6 +5,7 @@ from typing import Callable, Dict, List
 
 from .contracts import StoryRequest, StoryResult
 from .stories.business_marketing_story1 import run_business_marketing_story1
+from .stories.business_marketing_story2 import run_business_marketing_story2
 from .stories.data_science_story2 import run_data_science_story2
 from .stories.membership_fraud_story1 import run_membership_fraud_story1
 
@@ -28,6 +29,24 @@ STORY_CATALOG: Dict[str, StoryConfig] = {
         keywords=["campaign", "feedback", "channel", "sentiment", "theme", "marketing"],
         handler=run_business_marketing_story1,
     ),
+    "bm_story_2": StoryConfig(
+        story_id="bm_story_2",
+        domain="business_marketing",
+        title="Weekly Campaign KPI Diagnostics",
+        keywords=[
+            "weekly",
+            "metrics",
+            "ctr",
+            "cac",
+            "roas",
+            "spend",
+            "underperform",
+            "threshold",
+            "segment",
+            "campaign performance",
+        ],
+        handler=run_business_marketing_story2,
+    ),
     "ds_story_2": StoryConfig(
         story_id="ds_story_2",
         domain="data_science",
@@ -45,15 +64,14 @@ STORY_CATALOG: Dict[str, StoryConfig] = {
 }
 
 DOMAIN_TO_STORIES: Dict[str, List[str]] = {
-    "business_marketing": ["bm_story_1"],
+    "business_marketing": ["bm_story_1", "bm_story_2"],
     "data_science": ["ds_story_2"],
     "membership_fraud": ["mf_story_1"],
 }
 
-# Planned expansion slots for a total of 9 stories.
-# Fill handlers/keywords as each story is built.
+# Planned expansion slots for stories not yet wired.
 PLANNED_STORIES = {
-    "business_marketing": ["bm_story_2", "bm_story_3"],
+    "business_marketing": ["bm_story_3"],
     "data_science": ["ds_story_1", "ds_story_3"],
     "membership_fraud": ["mf_story_2", "mf_story_3"],
 }

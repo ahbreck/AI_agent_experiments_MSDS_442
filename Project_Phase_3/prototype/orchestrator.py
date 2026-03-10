@@ -205,12 +205,25 @@ class AgenticOrchestrator:
     def _llm_domain_route(self, user_query: str) -> Tuple[str, float, str]:
         domain_list = ", ".join(sorted(DOMAIN_TO_STORIES.keys()))
         recent = self.state.messages[-6:]
+        domain_guide = (
+            "DOMAIN GUIDE:\n"
+            "- business_marketing: campaign performance, campaign feedback themes, channel/segment breakdowns, weekly metrics, CTR/CAC/ROAS/spend, creative/messaging adjustments.\n"
+            "- data_science: member workout analytics, training trends, heart-rate zones, performance anomalies, workout-type segmentation.\n"
+            "- membership_fraud: security alerts, suspicious logins, risk events, account/device/location verification.\n"
+            "- clarify: only when domain cannot be chosen reliably.\n"
+            "\n"
+            "DISAMBIGUATION RULES:\n"
+            "- If query includes CTR/CAC/ROAS/campaign/channel/target segment/marketing performance, prefer business_marketing.\n"
+            "- Do not route to data_science just because dates, trends, or analysis language are present.\n"
+            "- DataScience usually involves workouts and often a member_id; business_marketing campaign analysis does not require member_id.\n"
+        )
         system = (
             "You are a top-level orchestrator router.\n"
             "Choose exactly one domain based on the user message and recent chat context.\n"
             f"Valid domains: {domain_list}, clarify.\n"
             "Use clarify only if domain cannot be chosen reliably.\n"
-            "If the current user message clearly indicates a different domain than the active domain, route to the new domain."
+            "If the current user message clearly indicates a different domain than the active domain, route to the new domain.\n"
+            f"{domain_guide}"
         )
         user = (
             f"ACTIVE_DOMAIN: {self.state.active_domain}\n"
@@ -224,7 +237,7 @@ class AgenticOrchestrator:
         domain = self._coerce_domain(out.domain) or "clarify"
         return domain, float(out.confidence), out.rationale
 
-    def _llm_story_route(self, domain: str, user_query: str) -> RouteDecision:
+    def _llm_story_route(self, domain: str, user_query: str) -> Tuple[RouteDecision, str]:
         candidates = DOMAIN_TO_STORIES[domain]
         titles = {sid: STORY_CATALOG[sid].title for sid in candidates}
         keywords = {sid: STORY_CATALOG[sid].keywords for sid in candidates}
@@ -248,20 +261,26 @@ class AgenticOrchestrator:
         picked = out.story_id if out.story_id in candidates else None
         if not picked:
             fallback = self._story_router(domain, user_query)
-            return RouteDecision(
-                target=fallback.target,
-                confidence=max(0.51, fallback.confidence),
-                rationale=f"LLM returned invalid story_id='{out.story_id}'. Fallback to keyword router.",
-                fallback_target=fallback.fallback_target,
-                missing_slots=fallback.missing_slots,
+            return (
+                RouteDecision(
+                    target=fallback.target,
+                    confidence=max(0.51, fallback.confidence),
+                    rationale=f"LLM returned invalid story_id='{out.story_id}'. Fallback to keyword router.",
+                    fallback_target=fallback.fallback_target,
+                    missing_slots=fallback.missing_slots,
+                ),
+                "deterministic_fallback_invalid_story_id",
             )
 
-        return RouteDecision(
-            target=picked,
-            confidence=float(out.confidence),
-            rationale=out.rationale or f"LLM selected story '{picked}' in domain '{domain}'.",
-            fallback_target=self.state.active_story_id,
-            missing_slots=[],
+        return (
+            RouteDecision(
+                target=picked,
+                confidence=float(out.confidence),
+                rationale=out.rationale or f"LLM selected story '{picked}' in domain '{domain}'.",
+                fallback_target=self.state.active_story_id,
+                missing_slots=[],
+            ),
+            "llm",
         )
 
     def _sync_member(self, user_query: str) -> None:
@@ -326,23 +345,29 @@ class AgenticOrchestrator:
             "active_story_before": self.state.active_story_id,
             "pending_slot_used": False,
             "router_style": "llm_langgraph",
+            "domain_selected_by": "unknown",
+            "story_selected_by": "unknown",
         }
 
         if pending_valid and self._slot_value_present(user_query) and self.state.pending_slot_target_story_id:
             sid = self.state.pending_slot_target_story_id
             dom = STORY_CATALOG[sid].domain
             metrics["pending_slot_used"] = True
+            metrics["domain_selected_by"] = "pending_slot_resume"
+            metrics["story_selected_by"] = "pending_slot_resume"
             return dom, sid, "pending_slot_fulfilled", metrics, False
 
         try:
             domain, domain_conf, domain_rationale = self._llm_domain_route(user_query)
             metrics["domain_llm_confidence"] = round(domain_conf, 2)
             metrics["domain_llm_rationale"] = domain_rationale
+            metrics["domain_selected_by"] = "llm"
         except Exception as exc:
             self.state.global_errors.append(f"domain_router_llm_error: {exc}")
             domain = top_domain if self._is_fresh_domain_high(top_score, margin) else "clarify"
             metrics["domain_llm_confidence"] = 0.0
             metrics["domain_llm_rationale"] = "LLM failed; deterministic fallback applied."
+            metrics["domain_selected_by"] = "deterministic_fallback"
 
         # Guardrail: when lexical signal is clearly strong, do not allow LLM clarify to block routing.
         if domain == "clarify" and self._is_fresh_domain_high(top_score, margin):
@@ -352,6 +377,22 @@ class AgenticOrchestrator:
                 f"Overridden by strong lexical domain signal: top_domain={top_domain}, top_score={top_score}, margin={margin}."
             ).strip()
             metrics["domain_guardrail_override"] = "llm_clarify_to_top_domain"
+            metrics["domain_selected_by"] = "lexical_guardrail_override"
+
+        # Guardrail: when lexical signal is clearly strong, do not allow LLM to pick a different domain.
+        if (
+            domain in DOMAIN_TO_STORIES
+            and top_domain in DOMAIN_TO_STORIES
+            and domain != top_domain
+            and self._is_fresh_domain_high(top_score, margin)
+        ):
+            domain = top_domain
+            metrics["domain_llm_rationale"] = (
+                f"{metrics.get('domain_llm_rationale', '')} "
+                f"Overridden by strong lexical domain signal: top_domain={top_domain}, top_score={top_score}, margin={margin}."
+            ).strip()
+            metrics["domain_guardrail_override"] = "llm_domain_to_top_domain"
+            metrics["domain_selected_by"] = "lexical_guardrail_override"
 
         if domain == "clarify":
             return None, None, "ambiguous_clarify_llm", metrics, True
@@ -360,14 +401,16 @@ class AgenticOrchestrator:
             return None, None, "invalid_domain_clarify", metrics, True
 
         try:
-            story_decision = self._llm_story_route(domain, user_query)
+            story_decision, story_selected_by = self._llm_story_route(domain, user_query)
             metrics["story_llm_confidence"] = round(story_decision.confidence, 2)
             metrics["story_llm_rationale"] = story_decision.rationale
+            metrics["story_selected_by"] = story_selected_by
         except Exception as exc:
             self.state.global_errors.append(f"story_router_llm_error: {exc}")
             story_decision = self._story_router(domain, user_query)
             metrics["story_llm_confidence"] = 0.0
             metrics["story_llm_rationale"] = "LLM failed; deterministic story fallback applied."
+            metrics["story_selected_by"] = "deterministic_fallback_exception"
 
         return domain, story_decision.target, "llm_domain_story_route", metrics, False
 
@@ -391,6 +434,8 @@ class AgenticOrchestrator:
                     "pending_slot_used": metrics.get("pending_slot_used"),
                     "domain_llm_confidence": metrics.get("domain_llm_confidence"),
                     "story_llm_confidence": metrics.get("story_llm_confidence"),
+                    "domain_selected_by": metrics.get("domain_selected_by"),
+                    "story_selected_by": metrics.get("story_selected_by"),
                 }
             )
             return {
