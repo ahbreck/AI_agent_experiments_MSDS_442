@@ -218,7 +218,7 @@ class AgenticOrchestrator:
             "DOMAIN GUIDE:\n"
             "- business_marketing: campaign performance, campaign feedback themes, channel/segment breakdowns, weekly metrics, CTR/CAC/ROAS/spend, creative/messaging adjustments, lead prioritization, outreach drafts, template-driven follow-ups.\n"
             "- data_science: member workout analytics, training trends, heart-rate zones, performance anomalies, workout-type segmentation.\n"
-            "- membership_fraud: security alerts, suspicious logins, risk events, account/device/location verification.\n"
+            "- membership_fraud: security alerts/risk events and account support issues such as login access, billing charges, and renewals.\n"
             "- clarify: only when domain cannot be chosen reliably.\n"
             "\n"
             "DISAMBIGUATION RULES:\n"

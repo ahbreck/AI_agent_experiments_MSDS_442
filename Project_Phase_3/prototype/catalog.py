@@ -9,6 +9,7 @@ from .stories.business_marketing_story2 import run_business_marketing_story2
 from .stories.business_marketing_story3 import run_business_marketing_story3
 from .stories.data_science_story2 import run_data_science_story2
 from .stories.membership_fraud_story1 import run_membership_fraud_story1
+from .stories.membership_fraud_story2 import run_membership_fraud_story2
 
 StoryHandler = Callable[[StoryRequest], StoryResult]
 
@@ -80,15 +81,48 @@ STORY_CATALOG: Dict[str, StoryConfig] = {
         story_id="mf_story_1",
         domain="membership_fraud",
         title="Security Event Explanation + Actions",
-        keywords=["fraud", "security", "login", "alert", "risk", "account", "device", "location"],
+        keywords=[
+            "fraud",
+            "security alert",
+            "suspicious login",
+            "risk event",
+            "unknown device",
+            "new location",
+            "account takeover",
+            "compromised account",
+            "device verification",
+            "location verification",
+        ],
         handler=run_membership_fraud_story1,
+    ),
+    "mf_story_2": StoryConfig(
+        story_id="mf_story_2",
+        domain="membership_fraud",
+        title="Account Issue Triage + Queue Routing",
+        keywords=[
+            "cannot login",
+            "can't log in",
+            "password reset",
+            "locked out",
+            "billing",
+            "charged",
+            "invoice",
+            "payment failed",
+            "refund",
+            "renewal",
+            "auto renew",
+            "subscription",
+            "expired membership",
+            "cancel membership",
+        ],
+        handler=run_membership_fraud_story2,
     ),
 }
 
 DOMAIN_TO_STORIES: Dict[str, List[str]] = {
     "business_marketing": ["bm_story_1", "bm_story_2", "bm_story_3"],
     "data_science": ["ds_story_2"],
-    "membership_fraud": ["mf_story_1"],
+    "membership_fraud": ["mf_story_1", "mf_story_2"],
 }
 
 # Planned expansion slots for stories not yet wired.
