@@ -7,6 +7,7 @@ from .contracts import StoryRequest, StoryResult
 from .stories.business_marketing_story1 import run_business_marketing_story1
 from .stories.business_marketing_story2 import run_business_marketing_story2
 from .stories.business_marketing_story3 import run_business_marketing_story3
+from .stories.data_science_story1 import run_data_science_story1
 from .stories.data_science_story2 import run_data_science_story2
 from .stories.data_science_story3 import run_data_science_story3
 from .stories.membership_fraud_story1 import run_membership_fraud_story1
@@ -71,6 +72,25 @@ STORY_CATALOG: Dict[str, StoryConfig] = {
             "trial",
         ],
         handler=run_business_marketing_story3,
+    ),
+    "ds_story_1": StoryConfig(
+        story_id="ds_story_1",
+        domain="data_science",
+        title="Workout Data Visualization Builder",
+        keywords=[
+            "chart",
+            "graph",
+            "plot",
+            "visual",
+            "visualize",
+            "visualization",
+            "line chart",
+            "bar chart",
+            "scatter",
+            "histogram",
+            "box plot",
+        ],
+        handler=run_data_science_story1,
     ),
     "ds_story_2": StoryConfig(
         story_id="ds_story_2",
@@ -160,13 +180,13 @@ STORY_CATALOG: Dict[str, StoryConfig] = {
 
 DOMAIN_TO_STORIES: Dict[str, List[str]] = {
     "business_marketing": ["bm_story_1", "bm_story_2", "bm_story_3"],
-    "data_science": ["ds_story_2", "ds_story_3"],
+    "data_science": ["ds_story_1", "ds_story_2", "ds_story_3"],
     "membership_fraud": ["mf_story_1", "mf_story_2", "mf_story_3"],
 }
 
 # Planned expansion slots for stories not yet wired.
 PLANNED_STORIES = {
     "business_marketing": [],
-    "data_science": ["ds_story_1"],
+    "data_science": [],
     "membership_fraud": [],
 }

@@ -42,6 +42,18 @@ MEMBER_SLOT_TEXT_HINTS = (
     "membership id",
     "membership identifier",
 )
+DATA_SCIENCE_VIZ_HINTS = (
+    "chart",
+    "graph",
+    "plot",
+    "visualize",
+    "visualization",
+    "histogram",
+    "scatter",
+    "box plot",
+    "line chart",
+    "bar chart",
+)
 
 
 class DomainRouteOutput(BaseModel):
@@ -226,7 +238,7 @@ class AgenticOrchestrator:
         domain_guide = (
             "DOMAIN GUIDE:\n"
             "- business_marketing: campaign performance, campaign feedback themes, channel/segment breakdowns, weekly metrics, CTR/CAC/ROAS/spend, creative/messaging adjustments, lead prioritization, outreach drafts, template-driven follow-ups.\n"
-            "- data_science: member workout analytics, training trends, heart-rate zones, performance anomalies, workout-type segmentation.\n"
+            "- data_science: member workout analytics, training trends, heart-rate zones, performance anomalies, workout-type segmentation, and chart/graph visualization requests for workout data.\n"
             "- membership_fraud: security alerts/risk events, account support issues such as login access/billing/renewals, and membership tier-fit optimization (upgrade/downgrade guidance based on usage).\n"
             "- clarify: only when domain cannot be chosen reliably.\n"
             "\n"
@@ -257,6 +269,19 @@ class AgenticOrchestrator:
         return domain, float(out.confidence), out.rationale
 
     def _llm_story_route(self, domain: str, user_query: str) -> Tuple[RouteDecision, str]:
+        tl = user_query.lower()
+        if domain == "data_science" and any(hint in tl for hint in DATA_SCIENCE_VIZ_HINTS):
+            return (
+                RouteDecision(
+                    target="ds_story_1",
+                    confidence=0.9,
+                    rationale="Deterministic visualization override: chart/plot language detected for data_science.",
+                    fallback_target=self.state.active_story_id,
+                    missing_slots=[],
+                ),
+                "deterministic_viz_override",
+            )
+
         candidates = DOMAIN_TO_STORIES[domain]
         titles = {sid: STORY_CATALOG[sid].title for sid in candidates}
         keywords = {sid: STORY_CATALOG[sid].keywords for sid in candidates}

@@ -17,6 +17,7 @@ dependencies:
   - matplotlib
   - seaborn
   - scipy
+  - plotly
 
   # --- PDF / image stack (conda versions are safer for compiled deps) ---
   - pillow
