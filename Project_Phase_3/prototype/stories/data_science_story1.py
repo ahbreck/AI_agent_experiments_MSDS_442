@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import json
+import os
+import re
 import sqlite3
 from collections import defaultdict
 from datetime import datetime
@@ -37,7 +40,30 @@ CHART_TYPE_HINTS: Dict[str, List[str]] = {
     "histogram": ["histogram", "distribution", "spread"],
     "box": ["box", "boxplot", "box plot", "outlier", "quartile"],
 }
-GENERIC_VIZ_HINTS = ["chart", "graph", "plot", "visualize", "visualization", "show me"]
+GENERIC_VIZ_HINTS = ["chart", "graph", "plot", "visualize", "visualization", "visual", "show me"]
+REFINEMENT_HINTS = [
+    "switch",
+    "change",
+    "instead",
+    "alter",
+    "modify",
+    "tweak",
+    "now",
+    "same chart",
+    "keep the same",
+    "also show",
+    "make it",
+    "update the chart",
+    "update it",
+    "update this",
+    "that chart",
+    "this chart",
+    "the chart you showed",
+    "the chart you showed me",
+    "what you showed me",
+    "refine",
+    "adjust",
+]
 
 
 def _contains_any(text: str, terms: List[str]) -> bool:
@@ -114,6 +140,124 @@ def _is_underspecified_viz_request(user_text: str, metrics: List[str]) -> bool:
     if not _is_explicit_chart_request(tl):
         return True
     return len(metrics) == 0
+
+
+def _has_dimension_hint(user_text: str) -> bool:
+    tl = user_text.lower()
+    return _contains_any(tl, ["weekday", "day of week", "time bucket", "time of day", "workout type", "class type", "type"])
+
+
+def _has_timeframe_hint(user_text: str) -> bool:
+    tl = user_text.lower()
+    if _contains_any(tl, ["last month", "last ", "past ", "between ", "since ", "weeks", "months", "quarter"]):
+        return True
+    return bool(re.search(r"\b\d{4}-\d{2}-\d{2}\b", tl))
+
+
+def _is_refinement_intent(user_text: str) -> bool:
+    tl = user_text.lower()
+    return _contains_any(tl, REFINEMENT_HINTS)
+
+
+def _safe_json_extract(text: str) -> Optional[Dict[str, Any]]:
+    try:
+        parsed = json.loads(text)
+        return parsed if isinstance(parsed, dict) else None
+    except json.JSONDecodeError:
+        pass
+    m = re.search(r"\{[\s\S]*\}", text)
+    if not m:
+        return None
+    try:
+        parsed = json.loads(m.group(0))
+        return parsed if isinstance(parsed, dict) else None
+    except json.JSONDecodeError:
+        return None
+
+
+def _deterministic_refinement_assessment(user_text: str) -> Dict[str, Any]:
+    tl = user_text.lower()
+    hint_hits = sum(1 for h in REFINEMENT_HINTS if h in tl)
+    deictic_hits = sum(1 for h in ["it", "that", "this", "same", "previous"] if re.search(rf"\b{re.escape(h)}\b", tl))
+    viz_context = 1 if _contains_any(tl, ["chart", "plot", "graph", "visual", "segment"]) else 0
+    raw = hint_hits * 0.45 + min(0.25, deictic_hits * 0.08) + viz_context * 0.2
+    confidence = round(min(0.99, raw), 3)
+    is_refinement = confidence >= 0.6
+    ambiguous = 0.35 <= confidence < 0.6
+    rationale = (
+        f"hint_hits={hint_hits}, deictic_hits={deictic_hits}, viz_context={viz_context}, "
+        f"confidence={confidence}"
+    )
+    return {
+        "is_refinement": is_refinement,
+        "confidence": confidence,
+        "ambiguous": ambiguous,
+        "rationale": rationale,
+    }
+
+
+def _maybe_llm_refinement_assessment(user_text: str, prior_plan: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    if not os.getenv("OPENAI_API_KEY"):
+        return None
+    try:
+        from langchain_openai import ChatOpenAI  # type: ignore
+    except Exception:
+        return None
+
+    model = ChatOpenAI(model="gpt-4o-mini", temperature=0)
+    system = (
+        "You classify whether the user's latest message is a refinement/edit request about a previously shown chart.\n"
+        "Return JSON only with keys: is_refinement (bool), confidence (0..1), rationale (string).\n"
+        "If unsure, set confidence below 0.65."
+    )
+    user = (
+        f"PRIOR_PLAN: {prior_plan}\n"
+        f"USER_MESSAGE: {user_text}\n"
+        "Decide if this message asks to modify/update/refine the prior chart rather than start a fresh request."
+    )
+    try:
+        out = model.invoke([("system", system), ("user", user)])
+        text = str(getattr(out, "content", "") or "")
+        parsed = _safe_json_extract(text)
+        if not isinstance(parsed, dict):
+            return None
+        conf_raw = parsed.get("confidence", 0.0)
+        try:
+            conf = float(conf_raw)
+        except (TypeError, ValueError):
+            conf = 0.0
+        return {
+            "is_refinement": bool(parsed.get("is_refinement", False)),
+            "confidence": round(max(0.0, min(1.0, conf)), 3),
+            "rationale": str(parsed.get("rationale", ""))[:240],
+        }
+    except Exception:
+        return None
+
+
+def _references_same_chart(user_text: str) -> bool:
+    tl = user_text.lower()
+    return _contains_any(
+        tl,
+        [
+            "same chart",
+            "keep the same",
+            "same visualization",
+            "same plot",
+            "same graph",
+        ],
+    )
+
+
+def _plan_diff(previous: Dict[str, Any], current: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
+    keys = ["chart_type", "metric", "secondary_metric", "dimension", "aggregation", "start_date", "end_date", "member_id"]
+    diff: Dict[str, Dict[str, Any]] = {}
+    for key in keys:
+        prev_val = previous.get(key)
+        curr_val = current.get(key)
+        if prev_val != curr_val:
+            diff[key] = {"from": prev_val, "to": curr_val}
+    return diff
 
 
 def _is_member_scoped_request(user_text: str) -> bool:
@@ -413,6 +557,68 @@ def run_data_science_story1(req: StoryRequest) -> StoryResult:
     fallback_member = req.member.member_id if req.member else None
     explicit_member = extract_explicit_member_id(user_text)
     member_id = normalize_member_id(explicit_member or fallback_member)
+    ds_state = req.domain_context.get("ds_story_1_state", {}) if isinstance(req.domain_context, dict) else {}
+    prior_plan = ds_state.get("last_plan") if isinstance(ds_state, dict) else None
+    if not isinstance(prior_plan, dict):
+        prior_plan = {}
+    last_update_message_count = ds_state.get("last_update_message_count") if isinstance(ds_state, dict) else None
+    current_message_count = len(req.messages) if isinstance(req.messages, list) else 0
+    same_chart_reference = _references_same_chart(user_text)
+    det_refine = _deterministic_refinement_assessment(user_text)
+    is_refinement_turn = bool(prior_plan) and bool(det_refine.get("is_refinement"))
+    intent_source = "deterministic_refinement_detector" if is_refinement_turn else "deterministic_direct"
+    refinement_detector_confidence = float(det_refine.get("confidence", 0.0))
+    refinement_detector_rationale = str(det_refine.get("rationale", ""))
+    llm_refine = None
+    det_confidence = float(det_refine.get("confidence", 0.0))
+    should_try_llm_fallback = bool(prior_plan) and det_confidence < 0.70
+    if should_try_llm_fallback:
+        llm_refine = _maybe_llm_refinement_assessment(user_text=user_text, prior_plan=prior_plan)
+        if isinstance(llm_refine, dict):
+            llm_conf = float(llm_refine.get("confidence", 0.0))
+            if llm_conf >= 0.68:
+                is_refinement_turn = bool(llm_refine.get("is_refinement", False))
+                intent_source = "llm_fallback"
+                refinement_detector_confidence = llm_conf
+                refinement_detector_rationale = str(llm_refine.get("rationale", "")) or refinement_detector_rationale
+    carried_forward_fields: List[str] = []
+
+    if same_chart_reference:
+        if not prior_plan:
+            question = "I do not have a previous chart in this thread yet. Which chart type do you want: line, bar, scatter, or histogram?"
+            return StoryResult(
+                story_id=req.story_id,
+                response_text=question,
+                follow_up_question=question,
+                story_output={
+                    "needs_clarification": True,
+                    "requested_slot": "chart_type",
+                    "missing_slots": ["chart_type"],
+                    "intent_source": "deterministic_same_chart_guardrail",
+                    "refinement_detector_confidence": refinement_detector_confidence,
+                    "refinement_detector_rationale": refinement_detector_rationale,
+                },
+            )
+        if isinstance(last_update_message_count, int) and (current_message_count - last_update_message_count) > 2:
+            question = (
+                "When you say 'same chart', do you mean the most recent visualization in this thread "
+                "or the earlier one?"
+            )
+            return StoryResult(
+                story_id=req.story_id,
+                response_text=question,
+                follow_up_question=question,
+                story_output={
+                    "needs_clarification": True,
+                    "requested_slot": "chart_reference",
+                    "missing_slots": ["chart_reference"],
+                    "intent_source": "deterministic_same_chart_guardrail",
+                    "refinement_detector_confidence": refinement_detector_confidence,
+                    "refinement_detector_rationale": refinement_detector_rationale,
+                    "last_update_message_count": last_update_message_count,
+                    "current_message_count": current_message_count,
+                },
+            )
 
     if _is_member_scoped_request(f" {user_text.strip()} ") and not member_id:
         ask = "I can build that chart. What is your member_id (for example, MB001)?"
@@ -420,22 +626,68 @@ def run_data_science_story1(req: StoryRequest) -> StoryResult:
             story_id=req.story_id,
             response_text=ask,
             follow_up_question=ask,
-            story_output={"needs_member_id": True, "requested_slot": "member_id", "missing_slots": ["member_id"]},
+            story_output={
+                "needs_member_id": True,
+                "requested_slot": "member_id",
+                "missing_slots": ["member_id"],
+                "intent_source": intent_source,
+                "refinement_detector_confidence": refinement_detector_confidence,
+                "refinement_detector_rationale": refinement_detector_rationale,
+            },
         )
 
-    start_date, end_date = parse_date_range_from_text(user_text, default_weeks=8)
+    if is_refinement_turn and not _has_timeframe_hint(user_text):
+        start_date = str(prior_plan.get("start_date") or "")
+        end_date = str(prior_plan.get("end_date") or "")
+        if start_date and end_date:
+            carried_forward_fields.extend(["start_date", "end_date"])
+        else:
+            start_date, end_date = parse_date_range_from_text(user_text, default_weeks=8)
+    else:
+        start_date, end_date = parse_date_range_from_text(user_text, default_weeks=8)
     metrics_in_text = _extract_metrics_from_text(user_text)
+    explicit_chart = _is_explicit_chart_request(user_text)
     chart_type = _pick_chart_type(user_text)
+    if is_refinement_turn and not explicit_chart and prior_plan.get("chart_type"):
+        chart_type = str(prior_plan.get("chart_type"))
+        carried_forward_fields.append("chart_type")
+
     primary_metric = metrics_in_text[0] if metrics_in_text else _pick_metric(user_text, fallback="duration_min")
+    if is_refinement_turn and not metrics_in_text and prior_plan.get("metric"):
+        primary_metric = str(prior_plan.get("metric"))
+        carried_forward_fields.append("metric")
+
     dimension = _pick_dimension(user_text, chart_type=chart_type)
+    if is_refinement_turn and not _has_dimension_hint(user_text) and prior_plan.get("dimension"):
+        dimension = str(prior_plan.get("dimension"))
+        carried_forward_fields.append("dimension")
     agg = "avg"
     if _contains_any(user_text.lower(), ["count", "number of workouts", "how many"]):
         agg = "count"
+    elif is_refinement_turn and prior_plan.get("aggregation"):
+        agg = str(prior_plan.get("aggregation"))
+        carried_forward_fields.append("aggregation")
 
     scatter_y_metric = metrics_in_text[1] if len(metrics_in_text) > 1 else ("calories" if primary_metric != "calories" else "duration_min")
+    if is_refinement_turn and chart_type == "scatter" and len(metrics_in_text) < 2 and prior_plan.get("secondary_metric"):
+        scatter_y_metric = str(prior_plan.get("secondary_metric"))
+        carried_forward_fields.append("secondary_metric")
+
+    if is_refinement_turn and not explicit_member and prior_plan.get("member_id"):
+        member_id = normalize_member_id(str(prior_plan.get("member_id"))) or member_id
+        if member_id:
+            carried_forward_fields.append("member_id")
+
     assumptions: List[str] = []
     warnings: List[str] = []
-    request_underspecified = _is_underspecified_viz_request(user_text, metrics=metrics_in_text)
+
+    # If user asks to "segment by ..." while prior chart is scatter and no explicit new chart type is given,
+    # prefer a segmented bar chart because scatter does not encode category segmentation clearly in this MVP.
+    if is_refinement_turn and chart_type == "scatter" and _has_dimension_hint(user_text) and not explicit_chart:
+        chart_type = "bar"
+        agg = "avg" if agg != "count" else agg
+        warnings.append("Converted scatter to bar chart to apply requested segmentation.")
+    request_underspecified = False if is_refinement_turn else _is_underspecified_viz_request(user_text, metrics=metrics_in_text)
     planner_source = "deterministic_direct"
     planner_confidence = 1.0 if _is_explicit_chart_request(user_text) else 0.7
     plan_candidates: List[Dict[str, Any]] = []
@@ -449,7 +701,9 @@ def run_data_science_story1(req: StoryRequest) -> StoryResult:
     selection_rationale = "Used direct deterministic mapping from explicit chart intent."
     if not explicit_member and member_id and _is_member_scoped_request(f" {user_text.strip()} "):
         assumptions.append(f"Used member_id from conversation context: {member_id}.")
-    if "last" not in user_text.lower() and "between" not in user_text.lower():
+    if is_refinement_turn and "start_date" in carried_forward_fields and "end_date" in carried_forward_fields:
+        assumptions.append("Kept prior timeframe from previous visualization turn.")
+    elif "last" not in user_text.lower() and "between" not in user_text.lower():
         assumptions.append("Used default date range: last 8 weeks.")
 
     rows = _read_rows(member_id=member_id, start_date=start_date, end_date=end_date)
@@ -465,6 +719,9 @@ def run_data_science_story1(req: StoryRequest) -> StoryResult:
                 "metric": primary_metric,
                 "dimension": dimension,
                 "date_range": {"start_date": start_date, "end_date": end_date},
+                "intent_source": intent_source,
+                "refinement_detector_confidence": refinement_detector_confidence,
+                "refinement_detector_rationale": refinement_detector_rationale,
             },
         )
 
@@ -507,11 +764,33 @@ def run_data_science_story1(req: StoryRequest) -> StoryResult:
                     "member_id": member_id,
                     "date_range": {"start_date": start_date, "end_date": end_date},
                     "request_underspecified": True,
+                    "is_refinement_turn": is_refinement_turn,
+                    "intent_source": intent_source,
+                    "refinement_detector_confidence": refinement_detector_confidence,
+                    "refinement_detector_rationale": refinement_detector_rationale,
+                    "carried_forward_fields": carried_forward_fields,
                     "planner_source": planner_source,
                     "planner_confidence": planner_confidence,
                     "plan_candidates": plan_candidates,
                     "selected_plan": selected_plan,
                     "selection_rationale": selection_rationale,
+                },
+                state_updates_domain={
+                    "ds_story_1_state": {
+                        "last_plan": {
+                            "chart_type": selected_plan.get("chart_type"),
+                            "metric": selected_plan.get("metric"),
+                            "secondary_metric": selected_plan.get("secondary_metric"),
+                            "dimension": selected_plan.get("dimension"),
+                            "aggregation": selected_plan.get("aggregation"),
+                            "start_date": start_date,
+                            "end_date": end_date,
+                            "member_id": member_id,
+                        },
+                        "last_candidates": plan_candidates,
+                        "last_update_message_count": current_message_count,
+                        "last_user_query": user_text,
+                    }
                 },
             )
 
@@ -605,8 +884,30 @@ def run_data_science_story1(req: StoryRequest) -> StoryResult:
         "aggregation": agg if chart_type in {"line", "bar"} else None,
         "score": planner_confidence,
     }
+    current_plan = {
+        "chart_type": chart_type,
+        "metric": primary_metric,
+        "secondary_metric": scatter_y_metric if chart_type == "scatter" else None,
+        "dimension": dimension,
+        "aggregation": agg if chart_type in {"line", "bar"} else None,
+        "start_date": start_date,
+        "end_date": end_date,
+        "member_id": member_id,
+    }
+    carried_forward_fields = list(dict.fromkeys(carried_forward_fields))
+    plan_diff = _plan_diff(previous=prior_plan, current=current_plan) if is_refinement_turn else {}
+    refinement_summary = ""
+    if is_refinement_turn:
+        if plan_diff:
+            changed = ", ".join(plan_diff.keys())
+            refinement_summary = f"Updated your previous chart settings ({changed}). "
+        else:
+            refinement_summary = "Kept your previous chart settings and refreshed the results. "
+        if "chart_type" not in plan_diff and "metric" not in plan_diff and "dimension" not in plan_diff and "aggregation" not in plan_diff and "secondary_metric" not in plan_diff and same_chart_reference:
+            refinement_summary = "Applied your update to the most recent visualization in this thread. " + refinement_summary
+
     response = (
-        f"{interpretation}\n"
+        f"{refinement_summary}{interpretation}\n"
         f"Date range: {start_date} to {end_date}. "
         f"{'Member scope: ' + member_id + '. ' if member_id else 'Scope: all members in Data Science workouts. '}"
         f"{'I selected this using a candidate-plan scorer for your underspecified request. ' if request_underspecified else ''}"
@@ -628,6 +929,12 @@ def run_data_science_story1(req: StoryRequest) -> StoryResult:
             "point_count": len(points) if isinstance(points, list) else 0,
             "assumptions": assumptions,
             "warnings": warnings,
+            "is_refinement_turn": is_refinement_turn,
+            "intent_source": intent_source,
+            "refinement_detector_confidence": refinement_detector_confidence,
+            "refinement_detector_rationale": refinement_detector_rationale,
+            "carried_forward_fields": carried_forward_fields,
+            "plan_diff": plan_diff,
             "request_underspecified": request_underspecified,
             "planner_source": planner_source,
             "planner_confidence": planner_confidence,
@@ -639,5 +946,13 @@ def run_data_science_story1(req: StoryRequest) -> StoryResult:
             "data_preview": points[:15] if isinstance(points, list) else [],
         },
         state_updates_global={"member": {"member_id": member_id}} if member_id else {},
-        state_updates_domain={"last_story_summary": interpretation},
+        state_updates_domain={
+            "last_story_summary": interpretation,
+            "ds_story_1_state": {
+                "last_plan": current_plan,
+                "last_candidates": plan_candidates,
+                "last_update_message_count": current_message_count,
+                "last_user_query": user_text,
+            },
+        },
     )

@@ -54,6 +54,19 @@ DATA_SCIENCE_VIZ_HINTS = (
     "line chart",
     "bar chart",
 )
+REFINEMENT_ROUTING_HINTS = (
+    "switch",
+    "change",
+    "instead",
+    "now",
+    "keep the same",
+    "same chart",
+    "same plot",
+    "same visualization",
+    "also show",
+    "make it",
+    "segment by",
+)
 
 
 class DomainRouteOutput(BaseModel):
@@ -198,6 +211,10 @@ class AgenticOrchestrator:
 
     def _is_fresh_domain_high(self, top_score: float, margin: float) -> bool:
         return top_score >= FRESH_HIGH and margin >= FRESH_MARGIN
+
+    def _looks_like_refinement_followup(self, user_query: str) -> bool:
+        q = user_query.lower()
+        return any(h in q for h in REFINEMENT_ROUTING_HINTS)
 
     def _story_router(self, domain: str, user_query: str) -> RouteDecision:
         candidate_ids = DOMAIN_TO_STORIES[domain]
@@ -456,6 +473,23 @@ class AgenticOrchestrator:
             ).strip()
             metrics["domain_guardrail_override"] = "llm_domain_to_top_domain"
             metrics["domain_selected_by"] = "lexical_guardrail_override"
+
+        # Guardrail: refinement-style follow-ups should not silently jump domains.
+        if (
+            self.state.active_domain in DOMAIN_TO_STORIES
+            and continuation_score >= CONT_HIGH
+            and self._looks_like_refinement_followup(user_query)
+            and domain in DOMAIN_TO_STORIES
+            and domain != self.state.active_domain
+        ):
+            if self._is_fresh_domain_high(top_score, margin):
+                metrics["domain_guardrail_override"] = "refinement_cross_domain_clarify"
+                metrics["domain_selected_by"] = "refinement_ambiguity_guardrail"
+                return None, None, "ambiguous_refinement_domain", metrics, True
+
+            domain = self.state.active_domain
+            metrics["domain_guardrail_override"] = "refinement_to_active_domain"
+            metrics["domain_selected_by"] = "refinement_continuation_guardrail"
 
         if domain == "clarify":
             return None, None, "ambiguous_clarify_llm", metrics, True
