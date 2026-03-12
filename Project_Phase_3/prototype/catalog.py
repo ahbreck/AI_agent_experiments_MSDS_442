@@ -8,6 +8,7 @@ from .stories.business_marketing_story1 import run_business_marketing_story1
 from .stories.business_marketing_story2 import run_business_marketing_story2
 from .stories.business_marketing_story3 import run_business_marketing_story3
 from .stories.data_science_story2 import run_data_science_story2
+from .stories.data_science_story3 import run_data_science_story3
 from .stories.membership_fraud_story1 import run_membership_fraud_story1
 from .stories.membership_fraud_story2 import run_membership_fraud_story2
 from .stories.membership_fraud_story3 import run_membership_fraud_story3
@@ -78,6 +79,22 @@ STORY_CATALOG: Dict[str, StoryConfig] = {
         keywords=["workout", "trend", "improv", "zone", "anomal", "performance", "strive", "cadence"],
         handler=run_data_science_story2,
     ),
+    "ds_story_3": StoryConfig(
+        story_id="ds_story_3",
+        domain="data_science",
+        title="Peer Benchmark Comparison + Improvement Suggestions",
+        keywords=[
+            "peer",
+            "peers",
+            "benchmark",
+            "compared to peers",
+            "compare to peers",
+            "weekly workouts",
+            "session length",
+            "consistency",
+        ],
+        handler=run_data_science_story3,
+    ),
     "mf_story_1": StoryConfig(
         story_id="mf_story_1",
         domain="membership_fraud",
@@ -143,13 +160,13 @@ STORY_CATALOG: Dict[str, StoryConfig] = {
 
 DOMAIN_TO_STORIES: Dict[str, List[str]] = {
     "business_marketing": ["bm_story_1", "bm_story_2", "bm_story_3"],
-    "data_science": ["ds_story_2"],
+    "data_science": ["ds_story_2", "ds_story_3"],
     "membership_fraud": ["mf_story_1", "mf_story_2", "mf_story_3"],
 }
 
 # Planned expansion slots for stories not yet wired.
 PLANNED_STORIES = {
     "business_marketing": [],
-    "data_science": ["ds_story_1", "ds_story_3"],
+    "data_science": ["ds_story_1"],
     "membership_fraud": [],
 }
