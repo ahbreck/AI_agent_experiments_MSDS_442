@@ -2,6 +2,7 @@ import sys
 import unittest
 from pathlib import Path
 from unittest.mock import patch
+import os
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -11,6 +12,7 @@ if str(PHASE3_ROOT) not in sys.path:
 
 from prototype.contracts import CanonicalMember, StoryRequest  # noqa: E402
 from prototype.stories.data_science_story3 import run_data_science_story3  # noqa: E402
+from prototype.stories.data_science_story3 import PlanOutput, PeerDefinition, MetricSelection  # noqa: E402
 
 
 class TestDataScienceStory3(unittest.TestCase):
@@ -62,9 +64,11 @@ class TestDataScienceStory3(unittest.TestCase):
         out = self._invoke("weekly workouts and consistency", domain_context=prior_state)
         payload = out.story_output
         selected = payload.get("plan_snapshot", {}).get("metrics", {}).get("selected", [])
+        assumptions = payload.get("plan_snapshot", {}).get("assumptions", [])
         self.assertFalse(payload.get("plan_snapshot", {}).get("needs_clarification"))
         self.assertIn("weekly_workouts", selected)
         self.assertIn("consistency_ratio", selected)
+        self.assertFalse(any(str(a).startswith("Used default metrics:") for a in assumptions))
 
     def test_story_output_schema_and_guardrails(self):
         out = self._invoke("Compare MB001 weekly workouts and consistency to peers for last 8 weeks.")
@@ -87,6 +91,7 @@ class TestDataScienceStory3(unittest.TestCase):
         self.assertTrue(required.issubset(set(payload.keys())))
         self.assertTrue(payload["guardrails"]["aggregated_peer_data_only"])
         self.assertFalse(payload["guardrails"]["medical_advice_enabled"])
+        self.assertIn(payload.get("member_metrics", {}).get("primary_type"), {"cycling", "tread", "rowing", "strength", "yoga", None})
 
     def test_comparison_deltas_are_deterministic(self):
         out = self._invoke("For MB001, compare weekly workouts and session length to peers for last 8 weeks.")
@@ -139,6 +144,53 @@ class TestDataScienceStory3(unittest.TestCase):
         self.assertNotIn("weekly_workouts", suggestion_metrics)
         self.assertNotIn("consistency_ratio", suggestion_metrics)
         self.assertIn("aggregated benchmarks", out.response_text.lower())
+
+    def test_hybrid_gate_skips_llm_when_uncertainty_low(self):
+        query = "Compare MB001 weekly workouts and consistency to all peers over the last 8 weeks."
+        with patch.dict(os.environ, {"PROTOTYPE_DS3_USE_LLM_PLAN": "1"}):
+            with patch("prototype.stories.data_science_story3._maybe_llm_plan") as mocked_llm:
+                out = self._invoke(query)
+        mocked_llm.assert_not_called()
+        self.assertEqual((out.story_output or {}).get("planner_source"), "deterministic_fallback")
+
+    def test_hybrid_gate_uses_llm_when_uncertainty_high(self):
+        llm_plan = PlanOutput(
+            member_id="MB001",
+            timeframe="last_8_weeks",
+            peer_definition=PeerDefinition(scope="all_members", rationale="llm"),
+            metrics=MetricSelection(selected=["weekly_workouts"], inferred=["weekly_workouts"]),
+            assumptions=["LLM selected weekly workouts as requested."],
+            ambiguities=[],
+            needs_clarification=False,
+            requested_slot=None,
+            clarifying_question=None,
+            planner_confidence=0.9,
+        )
+        with patch.dict(os.environ, {"PROTOTYPE_DS3_USE_LLM_PLAN": "1"}):
+            with patch("prototype.stories.data_science_story3._maybe_llm_plan", return_value=llm_plan) as mocked_llm:
+                out = self._invoke("Compare MB001 metrics to peers.")
+        mocked_llm.assert_called_once()
+        self.assertEqual((out.story_output or {}).get("planner_source"), "llm")
+        selected = ((out.story_output or {}).get("plan_snapshot") or {}).get("metrics", {}).get("selected", [])
+        self.assertEqual(selected, ["weekly_workouts"])
+
+    def test_hybrid_gate_falls_back_on_low_llm_confidence(self):
+        low_conf_llm_plan = PlanOutput(
+            member_id="MB001",
+            timeframe="last_8_weeks",
+            peer_definition=PeerDefinition(scope="all_members", rationale="llm"),
+            metrics=MetricSelection(selected=["weekly_workouts"], inferred=["weekly_workouts"]),
+            assumptions=["LLM plan"],
+            ambiguities=[],
+            needs_clarification=False,
+            requested_slot=None,
+            clarifying_question=None,
+            planner_confidence=0.1,
+        )
+        with patch.dict(os.environ, {"PROTOTYPE_DS3_USE_LLM_PLAN": "1"}):
+            with patch("prototype.stories.data_science_story3._maybe_llm_plan", return_value=low_conf_llm_plan):
+                out = self._invoke("Compare MB001 metrics to peers.")
+        self.assertEqual((out.story_output or {}).get("planner_source"), "deterministic_fallback_llm_low_confidence")
 
 
 if __name__ == "__main__":

@@ -69,6 +69,10 @@ class PeerBenchmarkState(TypedDict, total=False):
     suggestions: List[Dict[str, str]]
     response_text: str
     follow_up_question: Optional[str]
+    planner_source: str
+    uncertainty_score: float
+    uncertainty_signals: Dict[str, Any]
+    llm_plan_attempted: bool
 
 
 METRIC_LABELS = {
@@ -84,10 +88,32 @@ METRIC_KEYWORDS = {
 }
 
 DEFAULT_METRICS: List[MetricName] = ["weekly_workouts", "avg_session_length_min", "consistency_ratio"]
+HYBRID_UNCERTAINTY_THRESHOLD = 0.45
+LLM_MIN_CONFIDENCE = 0.55
 
 
 def _week_start(d: date) -> date:
     return d - timedelta(days=d.weekday())
+
+
+def _canonical_workout_type(raw: Optional[str]) -> Optional[str]:
+    value = (raw or "").strip().lower()
+    if not value:
+        return None
+    mapping = {
+        "bike": "cycling",
+        "cycling": "cycling",
+        "ride": "cycling",
+        "tread": "tread",
+        "run": "tread",
+        "running": "tread",
+        "treadmill": "tread",
+        "row": "rowing",
+        "rowing": "rowing",
+        "strength": "strength",
+        "yoga": "yoga",
+    }
+    return mapping.get(value, value)
 
 
 def _contains_phrase(text: str, phrase: str) -> bool:
@@ -271,6 +297,72 @@ def _maybe_llm_plan(user_text: str, fallback_member: Optional[str]) -> Optional[
         return None
 
 
+def _estimate_uncertainty(plan: PlanOutput, user_text: str, pending_slot: Optional[str] = None) -> Tuple[float, Dict[str, Any]]:
+    tl = (user_text or "").lower()
+    score = 0.0
+
+    signals: Dict[str, Any] = {
+        "member_id_missing": plan.member_id is None,
+        "metrics_ambiguous": "metrics" in plan.ambiguities,
+        "peer_definition_ambiguous": "peer_definition" in plan.ambiguities,
+        "timeframe_ambiguous": "timeframe" in plan.ambiguities,
+        "pending_slot_active": bool(pending_slot),
+        "low_phrase_coverage": False,
+    }
+
+    if signals["member_id_missing"]:
+        score += 0.45
+    if signals["metrics_ambiguous"]:
+        score += 0.30
+    if signals["peer_definition_ambiguous"]:
+        score += 0.25
+    if signals["timeframe_ambiguous"]:
+        score += 0.20
+    if signals["pending_slot_active"]:
+        score += 0.15
+
+    phrase_hits = 0
+    metric_terms = [term for terms in METRIC_KEYWORDS.values() for term in terms]
+    peer_terms = [
+        "all members",
+        "same workout type",
+        "same type",
+        "similar activity",
+        "similar frequency",
+        "last 4 weeks",
+        "last 8 weeks",
+        "last 12 weeks",
+        "last month",
+        "last 3 months",
+    ]
+    for term in metric_terms + peer_terms:
+        if _contains_phrase(tl, term):
+            phrase_hits += 1
+
+    if phrase_hits == 0:
+        score += 0.20
+        signals["low_phrase_coverage"] = True
+    elif phrase_hits == 1:
+        score += 0.10
+        signals["low_phrase_coverage"] = True
+
+    signals["phrase_hits"] = phrase_hits
+    score = max(0.0, min(1.0, round(score, 3)))
+    return score, signals
+
+
+def _llm_plan_contradictory(plan: PlanOutput) -> bool:
+    if plan.needs_clarification and not plan.requested_slot:
+        return True
+    if not plan.needs_clarification and plan.requested_slot is not None:
+        return True
+    if plan.member_id is None and not plan.needs_clarification:
+        return True
+    if plan.requested_slot and plan.requested_slot not in plan.ambiguities:
+        return True
+    return False
+
+
 def _merge_pending_slot_answer(plan: PlanOutput, pending_slot: Optional[str], answer_text: str) -> PlanOutput:
     if pending_slot not in {"member_id", "metrics", "peer_definition", "timeframe"}:
         return plan
@@ -293,6 +385,9 @@ def _merge_pending_slot_answer(plan: PlanOutput, pending_slot: Optional[str], an
         selected, inferred, ambiguous = _parse_metrics_from_text(answer)
         if not ambiguous:
             updated.metrics = MetricSelection(selected=selected, inferred=inferred)
+            updated.assumptions = [
+                a for a in updated.assumptions if not a.startswith("Used default metrics:")
+            ]
             updated.assumptions = [*updated.assumptions, "Applied metrics from user clarification."][:5]
             updated.needs_clarification = False
             updated.requested_slot = None
@@ -401,7 +496,7 @@ def read_member_metrics(member_id: str, start_date: str, end_date: str) -> Dict[
 
     type_counts: Dict[str, int] = {}
     for row in rows:
-        typ = str(row.get("type") or "").lower()
+        typ = _canonical_workout_type(str(row.get("type") or ""))
         if not typ:
             continue
         type_counts[typ] = type_counts.get(typ, 0) + 1
@@ -431,10 +526,10 @@ def _filter_rows_by_peer_definition(
         return rows
 
     if scope == "same_primary_type":
-        target = peer_definition.primary_type or member_primary_type
+        target = _canonical_workout_type(peer_definition.primary_type or member_primary_type)
         if not target:
             return rows
-        return [r for r in rows if str(r.get("type") or "").lower() == str(target).lower()]
+        return [r for r in rows if _canonical_workout_type(str(r.get("type") or "")) == str(target).lower()]
 
     # similar_activity_band
     if scope == "similar_activity_band" and member_activity_band:
@@ -618,10 +713,45 @@ def _format_metric_line(metric: str, comparison: Dict[str, Optional[float]]) -> 
 def _plan_request_node(state: PeerBenchmarkState) -> PeerBenchmarkState:
     user_text = state.get("user_text", "")
     fallback_member = state.get("fallback_member")
+    pending_slot = state.get("prior_pending_slot")
 
-    llm_plan = _maybe_llm_plan(user_text=user_text, fallback_member=fallback_member)
-    plan_model = llm_plan or _deterministic_plan(user_text=user_text, fallback_member=fallback_member)
-    return {"plan": plan_model.model_dump()}
+    deterministic = _deterministic_plan(user_text=user_text, fallback_member=fallback_member)
+    uncertainty_score, uncertainty_signals = _estimate_uncertainty(
+        plan=deterministic,
+        user_text=user_text,
+        pending_slot=pending_slot,
+    )
+    deterministic.planner_confidence = round(1.0 - uncertainty_score, 2)
+
+    planner_source = "deterministic_fallback"
+    llm_plan_attempted = False
+    plan_model = deterministic
+
+    llm_enabled = os.getenv("PROTOTYPE_DS3_USE_LLM_PLAN", "0").strip() in {"1", "true", "TRUE"}
+    threshold = float(os.getenv("PROTOTYPE_DS3_UNCERTAINTY_THRESHOLD", str(HYBRID_UNCERTAINTY_THRESHOLD)))
+    llm_min_conf = float(os.getenv("PROTOTYPE_DS3_LLM_MIN_CONF", str(LLM_MIN_CONFIDENCE)))
+
+    # Do not switch planning mode mid-clarification; keep deterministic while slot is pending.
+    if llm_enabled and pending_slot is None and uncertainty_score >= threshold:
+        llm_plan_attempted = True
+        llm_plan = _maybe_llm_plan(user_text=user_text, fallback_member=fallback_member)
+        if llm_plan is None:
+            planner_source = "deterministic_fallback_llm_unavailable"
+        elif _llm_plan_contradictory(llm_plan):
+            planner_source = "deterministic_fallback_llm_contradictory"
+        elif float(llm_plan.planner_confidence) < llm_min_conf:
+            planner_source = "deterministic_fallback_llm_low_confidence"
+        else:
+            planner_source = "llm"
+            plan_model = llm_plan
+
+    return {
+        "plan": plan_model.model_dump(),
+        "planner_source": planner_source,
+        "uncertainty_score": uncertainty_score,
+        "uncertainty_signals": uncertainty_signals,
+        "llm_plan_attempted": llm_plan_attempted,
+    }
 
 
 def _merge_user_answer_node(state: PeerBenchmarkState) -> PeerBenchmarkState:
@@ -875,6 +1005,10 @@ def run_data_science_story3(req: StoryRequest) -> StoryResult:
                 "requested_slot": plan.requested_slot,
                 "missing_slots": [plan.requested_slot] if plan.requested_slot else [],
                 "plan_snapshot": plan.model_dump(),
+                "planner_source": state_out.get("planner_source"),
+                "uncertainty_score": state_out.get("uncertainty_score"),
+                "uncertainty_signals": state_out.get("uncertainty_signals", {}),
+                "llm_plan_attempted": state_out.get("llm_plan_attempted", False),
             },
             state_updates_domain={
                 "ds_story_3_state": {
@@ -897,6 +1031,10 @@ def run_data_science_story3(req: StoryRequest) -> StoryResult:
         "end_date": state_out.get("end_date"),
         "timeframe_label": state_out.get("timeframe_label"),
         "plan_snapshot": plan.model_dump(),
+        "planner_source": state_out.get("planner_source"),
+        "uncertainty_score": state_out.get("uncertainty_score"),
+        "uncertainty_signals": state_out.get("uncertainty_signals", {}),
+        "llm_plan_attempted": state_out.get("llm_plan_attempted", False),
         "member_metrics": member_metrics,
         "peer_benchmarks": peer_data.get("benchmarks", {}),
         "peer_member_count": peer_data.get("peer_member_count", 0),
