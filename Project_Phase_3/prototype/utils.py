@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 import re
+import sqlite3
 from datetime import date, timedelta
-from typing import List, Optional, Tuple
+from typing import Any, Callable, List, Optional, Tuple
 
 
 def normalize_token_alnum(raw: Optional[str]) -> Optional[str]:
@@ -10,6 +11,10 @@ def normalize_token_alnum(raw: Optional[str]) -> Optional[str]:
         return None
     token = re.sub(r"[^A-Z0-9]", "", raw.strip().upper())
     return token or None
+
+
+def normalize_id(raw: Optional[str]) -> Optional[str]:
+    return normalize_token_alnum(raw)
 
 
 def normalize_member_id(raw: Optional[str]) -> Optional[str]:
@@ -46,7 +51,10 @@ def extract_explicit_member_id(raw: Optional[str]) -> Optional[str]:
     if not raw:
         return None
     text = raw.strip().upper()
-    m = re.search(r"\bMB[\s_-]?\d{3}\b", text)
+    m = re.search(r"\bMB[^A-Z0-9]*\d{3}\b", text)
+    if m:
+        return normalize_member_id(m.group(0))
+    m = re.search(r"\bM[^A-Z0-9]*\d{3}\b", text)
     if m:
         return normalize_member_id(m.group(0))
     return None
@@ -57,7 +65,23 @@ def member_id_aliases(raw: Optional[str]) -> List[str]:
     if not norm:
         return []
     digits = norm[-3:]
-    return [norm, f"M{digits}", f"MB-{digits}"]
+    aliases: List[str] = []
+    for candidate in (norm, f"M{digits}", digits):
+        normalized = normalize_token_alnum(candidate)
+        if normalized and normalized not in aliases:
+            aliases.append(normalized)
+    return aliases
+
+
+def sql_norm_alnum(value: Any) -> str:
+    if value is None:
+        return ""
+    return normalize_token_alnum(str(value)) or ""
+
+
+def register_sqlite_alnum_normalizer(conn: sqlite3.Connection, function_name: str = "NORM_ALNUM") -> None:
+    fn: Callable[[Any], str] = sql_norm_alnum
+    conn.create_function(function_name, 1, fn)
 
 
 def parse_last_n_weeks(user_text: str, default_weeks: int) -> Tuple[str, str, str]:

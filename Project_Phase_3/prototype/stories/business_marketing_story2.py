@@ -12,7 +12,7 @@ from langchain_core.runnables.graph_mermaid import MermaidDrawMethod
 from langgraph.graph import END, StateGraph
 from pydantic import BaseModel, Field
 from ..contracts import StoryRequest, StoryResult
-from ..utils import normalize_campaign_id
+from ..utils import normalize_campaign_id, register_sqlite_alnum_normalizer
 
 PROJECT_PHASE_3 = Path(__file__).resolve().parents[2]
 DB_PATH = PROJECT_PHASE_3 / "kb" / "BusinessMarketing" / "brand_feedback.db"
@@ -314,7 +314,7 @@ def _requested_unavailable_dimensions(user_text: str) -> List[str]:
 
 def _extract_filters(user_text: str, grouped_by: Sequence[str]) -> Dict[str, Any]:
     t = user_text.lower()
-    campaign_ids_raw = re.findall(r"\bCAMP[_-]?\d+\b", user_text.upper())
+    campaign_ids_raw = re.findall(r"\bCAMP[\W_]*\d+\b", user_text.upper())
     campaign_ids = [normalize_campaign_id(cid) for cid in campaign_ids_raw]
     campaign_ids = [cid for cid in campaign_ids if cid]
 
@@ -363,7 +363,7 @@ def read_campaign_metrics(
 
     campaign_ids = filters.get("campaign_ids")
     if campaign_ids:
-        where.append(f"wm.campaign_id IN ({','.join(['?'] * len(campaign_ids))})")
+        where.append(f"NORM_ALNUM(wm.campaign_id) IN ({','.join(['?'] * len(campaign_ids))})")
         params.extend(campaign_ids)
 
     channels = filters.get("channels")
@@ -800,6 +800,7 @@ def run_business_marketing_story2(req: StoryRequest) -> StoryResult:
     metric_defs = _select_metric_definitions(user_text) if (glossary_only or intent == "definitions") else {}
 
     with sqlite3.connect(DB_PATH) as conn:
+        register_sqlite_alnum_normalizer(conn)
         _ensure_threshold_table(conn)
         available_weeks = _get_available_weeks(conn)
 

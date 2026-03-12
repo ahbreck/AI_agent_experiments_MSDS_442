@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import asdict
 import os
+import re
 import warnings
 from typing import Any, Dict, List, Optional, Tuple, TypedDict
 
@@ -33,6 +34,14 @@ CONT_HIGH = 0.70
 FRESH_HIGH = 0.62
 FRESH_MARGIN = 0.20
 PENDING_TTL_TURNS = 3
+MEMBER_SLOT_TEXT_HINTS = (
+    "member_id",
+    "member id",
+    "member identifier",
+    "member identification",
+    "membership id",
+    "membership identifier",
+)
 
 
 class DomainRouteOutput(BaseModel):
@@ -320,8 +329,27 @@ class AgenticOrchestrator:
         self.state.pending_turn_created = None
 
     def _update_pending_from_result(self, result: StoryResult) -> None:
+        story_output = result.story_output if isinstance(result.story_output, dict) else {}
+        requested_slot = story_output.get("requested_slot")
+        missing_slots = story_output.get("missing_slots")
+        asks_for_member = False
+
+        if isinstance(requested_slot, str):
+            asks_for_member = requested_slot.strip().lower() == "member_id"
+        elif isinstance(missing_slots, list):
+            asks_for_member = any(str(slot).strip().lower() == "member_id" for slot in missing_slots)
+
+        if not asks_for_member and story_output.get("needs_member_id") is True:
+            asks_for_member = True
+
+        if not asks_for_member and result.follow_up_question:
+            follow_up = result.follow_up_question.lower()
+            asks_for_member = any(hint in follow_up for hint in MEMBER_SLOT_TEXT_HINTS) or bool(
+                re.search(r"\bmember\b[\s_-]*(id|identifier|identification)\b", follow_up)
+            )
+
         self.state.pending_question = result.follow_up_question
-        if result.follow_up_question and "member_id" in result.follow_up_question.lower():
+        if result.follow_up_question and asks_for_member:
             self.state.pending_slot_type = "member_id"
             self.state.pending_slot_target_story_id = result.story_id
             self.state.pending_turn_created = self.state.turn_index

@@ -12,7 +12,12 @@ from langgraph.graph import END, StateGraph
 from pydantic import BaseModel, Field
 
 from ..contracts import StoryRequest, StoryResult
-from ..utils import extract_explicit_member_id, normalize_campaign_id, parse_last_n_weeks
+from ..utils import (
+    extract_explicit_member_id,
+    normalize_campaign_id,
+    parse_last_n_weeks,
+    register_sqlite_alnum_normalizer,
+)
 
 PROJECT_PHASE_2 = Path(__file__).resolve().parents[2]
 DB_PATH = PROJECT_PHASE_2 / "kb" / "BusinessMarketing" / "brand_feedback.db"
@@ -70,7 +75,7 @@ def _read_campaign_feedback(filters: Dict[str, Any]) -> List[Dict[str, Any]]:
 
     campaign_ids = filters.get("campaign_ids")
     if campaign_ids:
-        where.append(f"REPLACE(REPLACE(UPPER(campaign_id), '-', ''), '_', '') IN ({','.join(['?'] * len(campaign_ids))})")
+        where.append(f"NORM_ALNUM(campaign_id) IN ({','.join(['?'] * len(campaign_ids))})")
         params.extend(campaign_ids)
 
     channels = filters.get("feedback_channels")
@@ -80,7 +85,7 @@ def _read_campaign_feedback(filters: Dict[str, Any]) -> List[Dict[str, Any]]:
 
     member_id = filters.get("member_id")
     if member_id:
-        where.append("REPLACE(REPLACE(UPPER(member_id), '-', ''), '_', '') = ?")
+        where.append("NORM_ALNUM(member_id) = ?")
         params.append(member_id)
 
     if filters.get("start_date"):
@@ -100,6 +105,7 @@ def _read_campaign_feedback(filters: Dict[str, Any]) -> List[Dict[str, Any]]:
     """
 
     with sqlite3.connect(DB_PATH) as conn:
+        register_sqlite_alnum_normalizer(conn)
         conn.row_factory = sqlite3.Row
         rows = [dict(r) for r in conn.execute(sql, params).fetchall()]
     return rows
@@ -144,7 +150,7 @@ def _aggregate_themes(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
 
 
 def _parse_filters(user_text: str) -> Dict[str, Any]:
-    campaign_ids_raw = re.findall(r"\bCAMP[_-]?\d+\b", user_text.upper())
+    campaign_ids_raw = re.findall(r"\bCAMP[\W_]*\d+\b", user_text.upper())
     campaign_ids = [normalize_campaign_id(cid) for cid in campaign_ids_raw]
     campaign_ids = [cid for cid in campaign_ids if cid]
     member_id = extract_explicit_member_id(user_text)

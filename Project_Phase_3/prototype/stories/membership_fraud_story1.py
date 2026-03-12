@@ -12,7 +12,12 @@ from langgraph.graph import END, StateGraph
 from pydantic import BaseModel, Field
 
 from ..contracts import StoryRequest, StoryResult
-from ..utils import extract_explicit_member_id, member_id_aliases
+from ..utils import (
+    extract_explicit_member_id,
+    member_id_aliases,
+    normalize_member_id,
+    register_sqlite_alnum_normalizer,
+)
 
 PROJECT_PHASE_2 = Path(__file__).resolve().parents[2]
 DB_PATH = PROJECT_PHASE_2 / "kb" / "MembershipFraud" / "membership_fraud.db"
@@ -273,6 +278,7 @@ def _read_security_events(member_id: str, timeframe: Timeframe, max_events: int 
     placeholders = ",".join(["?"] * len(aliases))
 
     with sqlite3.connect(DB_PATH) as conn:
+        register_sqlite_alnum_normalizer(conn)
         conn.row_factory = sqlite3.Row
         cur = conn.cursor()
 
@@ -280,7 +286,7 @@ def _read_security_events(member_id: str, timeframe: Timeframe, max_events: int 
             sql = f"""
             SELECT event_id, member_id, event_ts, login_location, device_type, risk_level, trigger_reason, recommended_action
             FROM security_events
-            WHERE REPLACE(REPLACE(UPPER(member_id), '-', ''), '_', '') IN ({placeholders})
+            WHERE NORM_ALNUM(member_id) IN ({placeholders})
             ORDER BY event_ts DESC
             LIMIT ?
             """
@@ -291,7 +297,7 @@ def _read_security_events(member_id: str, timeframe: Timeframe, max_events: int 
         sql = f"""
         SELECT event_id, member_id, event_ts, login_location, device_type, risk_level, trigger_reason, recommended_action
         FROM security_events
-        WHERE REPLACE(REPLACE(UPPER(member_id), '-', ''), '_', '') IN ({placeholders}) AND event_ts >= ?
+        WHERE NORM_ALNUM(member_id) IN ({placeholders}) AND event_ts >= ?
         ORDER BY event_ts DESC
         LIMIT ?
         """
@@ -319,19 +325,6 @@ def _guide_security_actions(event: Dict[str, Any]) -> List[str]:
     if risk == "medium":
         return base + ["Enable MFA for added protection.", "Update account recovery options."]
     return base + ["No urgent action is needed if you recognize the login context."]
-
-
-def _normalize_member_id(value: Optional[str]) -> Optional[str]:
-    if not value:
-        return None
-    token = re.sub(r"[^A-Za-z0-9]", "", value).upper()
-    if not token:
-        return None
-    if token.startswith("MB"):
-        return f"MB-{token[2:]}"
-    if token.startswith("M"):
-        return f"MB-{token[1:]}"
-    return token
 
 
 def _planner_node(state: SecurityState, llm: ChatOpenAI) -> SecurityState:
@@ -370,7 +363,7 @@ def _planner_node(state: SecurityState, llm: ChatOpenAI) -> SecurityState:
             "tone": "neutral",
         }
 
-    member_id = _normalize_member_id(plan.get("member_id")) or existing_member_id
+    member_id = normalize_member_id(plan.get("member_id")) or existing_member_id
     timeframe = plan.get("timeframe") or fallback_timeframe
     ask_for_member = bool(plan.get("ask_for_member_id", False) and not member_id)
 
@@ -539,7 +532,7 @@ def get_membership_fraud_story1_mermaid() -> str:
 
 def run_membership_fraud_story1(req: StoryRequest) -> StoryResult:
     member_from_query = extract_explicit_member_id(req.user_query)
-    member_id = _normalize_member_id(member_from_query or req.member.member_id or req.domain_context.get("member_id"))
+    member_id = normalize_member_id(member_from_query or req.member.member_id or req.domain_context.get("member_id"))
     timeframe = req.domain_context.get("timeframe")
 
     state_in: SecurityState = {
@@ -564,6 +557,10 @@ def run_membership_fraud_story1(req: StoryRequest) -> StoryResult:
         "latest_event": state_out.get("latest_event"),
         "security_help_snippets": state_out.get("security_help_snippets", []),
     }
+    if follow_up and not final_member:
+        story_output["requested_slot"] = "member_id"
+        story_output["missing_slots"] = ["member_id"]
+        story_output["needs_member_id"] = True
 
     return StoryResult(
         story_id=req.story_id,

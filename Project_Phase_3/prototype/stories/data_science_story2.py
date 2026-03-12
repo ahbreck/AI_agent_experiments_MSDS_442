@@ -12,7 +12,13 @@ from typing import Any, Dict, List, Literal, Optional, Tuple, TypedDict, Union
 from langgraph.graph import END, StateGraph
 from pydantic import BaseModel, Field, ValidationError
 from ..contracts import StoryRequest, StoryResult
-from ..utils import extract_explicit_member_id, parse_date_range_from_text
+from ..utils import (
+    extract_explicit_member_id,
+    normalize_member_id,
+    normalize_token_alnum,
+    parse_date_range_from_text,
+    register_sqlite_alnum_normalizer,
+)
 
 PROJECT_PHASE_2 = Path(__file__).resolve().parents[2]
 DB_PATH = PROJECT_PHASE_2 / "kb" / "DataScience" / "peloton_workouts.sqlite"
@@ -191,7 +197,7 @@ def _phrase_in_text(text: str, phrase: str) -> bool:
 
 
 def _clean_member_token(member_id: str) -> str:
-    return re.sub(r"[^A-Z0-9]", "", str(member_id or "").upper())
+    return normalize_token_alnum(member_id) or ""
 
 
 def _extract_date_range(user_text: str) -> Optional[Tuple[str, str]]:
@@ -234,7 +240,7 @@ def _infer_types(user_text: str) -> Optional[List[str]]:
 
 
 def _parse_request(user_text: str, fallback_member: Optional[str]) -> Tuple[Optional[str], str, str, Optional[List[str]]]:
-    member = extract_explicit_member_id(user_text) or fallback_member
+    member = extract_explicit_member_id(user_text) or normalize_member_id(fallback_member)
     explicit = _extract_date_range(user_text)
     if explicit:
         start, end = explicit
@@ -247,7 +253,7 @@ def _read_workouts(member_id: str, start_date: str, end_date: str, types: Option
     q = """
     SELECT *
     FROM workouts
-    WHERE REPLACE(REPLACE(UPPER(member_id), '-', ''), '_', '') = ?
+    WHERE NORM_ALNUM(member_id) = ?
       AND date >= ?
       AND date <= ?
     """
@@ -257,6 +263,7 @@ def _read_workouts(member_id: str, start_date: str, end_date: str, types: Option
         params.extend([t.lower() for t in types])
 
     with sqlite3.connect(DB_PATH) as conn:
+        register_sqlite_alnum_normalizer(conn)
         conn.row_factory = sqlite3.Row
         return [dict(r) for r in conn.execute(q, params).fetchall()]
 
@@ -924,7 +931,7 @@ def run_data_science_story2(req: StoryRequest) -> StoryResult:
             story_id=req.story_id,
             response_text=ask,
             follow_up_question=ask,
-            story_output={"needs_member_id": True},
+            story_output={"needs_member_id": True, "requested_slot": "member_id", "missing_slots": ["member_id"]},
         )
 
     member_id = state_out.get("member_id")
