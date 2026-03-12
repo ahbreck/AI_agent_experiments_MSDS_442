@@ -29,6 +29,15 @@ METRIC_ALIASES: Dict[str, List[str]] = {
     "resistance_percent": ["resistance", "resistance_percent"],
     "incline_percent": ["incline", "incline_percent"],
 }
+SUPPORTED_TRACE_TYPES = {"scatter", "bar", "histogram", "box"}
+CHART_TYPE_HINTS: Dict[str, List[str]] = {
+    "line": ["line", "trend", "over time", "timeline", "time series", "weekly"],
+    "bar": ["bar", "compare", "comparison", "by type", "by weekday", "breakdown"],
+    "scatter": ["scatter", "relationship", "correlation", "versus", "vs"],
+    "histogram": ["histogram", "distribution", "spread"],
+    "box": ["box", "boxplot", "box plot", "outlier", "quartile"],
+}
+GENERIC_VIZ_HINTS = ["chart", "graph", "plot", "visualize", "visualization", "show me"]
 
 
 def _contains_any(text: str, terms: List[str]) -> bool:
@@ -42,6 +51,17 @@ def _pick_metric(user_text: str, fallback: str = "duration_min") -> str:
         if _contains_any(tl, aliases):
             return metric
     return fallback
+
+
+def _metric_has_values(rows: List[Dict[str, Any]], metric: str) -> bool:
+    for row in rows:
+        if row.get(metric) is not None:
+            return True
+    return False
+
+
+def _count_metric_values(rows: List[Dict[str, Any]], metric: str) -> int:
+    return sum(1 for r in rows if r.get(metric) is not None)
 
 
 def _pick_chart_type(user_text: str) -> str:
@@ -68,6 +88,32 @@ def _pick_dimension(user_text: str, chart_type: str) -> str:
     if chart_type == "line":
         return "week_start"
     return "type"
+
+
+def _extract_metrics_from_text(user_text: str) -> List[str]:
+    tl = user_text.lower()
+    matched: List[str] = []
+    for metric, aliases in METRIC_ALIASES.items():
+        if _contains_any(tl, aliases):
+            matched.append(metric)
+    return matched
+
+
+def _is_explicit_chart_request(user_text: str) -> bool:
+    tl = user_text.lower()
+    for hints in CHART_TYPE_HINTS.values():
+        if _contains_any(tl, hints):
+            return True
+    return False
+
+
+def _is_underspecified_viz_request(user_text: str, metrics: List[str]) -> bool:
+    tl = user_text.lower()
+    if not _contains_any(tl, GENERIC_VIZ_HINTS):
+        return False
+    if not _is_explicit_chart_request(tl):
+        return True
+    return len(metrics) == 0
 
 
 def _is_member_scoped_request(user_text: str) -> bool:
@@ -261,6 +307,107 @@ def _build_plotly_spec(
     }
 
 
+def _is_valid_plotly_spec(chart_spec: Dict[str, Any]) -> bool:
+    if not isinstance(chart_spec, dict):
+        return False
+    if chart_spec.get("library") != "plotly":
+        return False
+    data = chart_spec.get("data")
+    if not isinstance(data, list) or not data:
+        return False
+    for trace in data:
+        if not isinstance(trace, dict):
+            return False
+        if trace.get("type") not in SUPPORTED_TRACE_TYPES:
+            return False
+    return True
+
+
+def _build_candidate_plans(user_text: str, primary_metric: str, metrics_in_text: List[str]) -> List[Dict[str, Any]]:
+    metric_x = primary_metric
+    metric_y = metrics_in_text[1] if len(metrics_in_text) > 1 else ("calories" if primary_metric != "calories" else "duration_min")
+    base_dimension = _pick_dimension(user_text, chart_type="bar")
+    return [
+        {
+            "chart_type": "line",
+            "metric": metric_x,
+            "secondary_metric": None,
+            "dimension": "week_start",
+            "aggregation": "avg",
+            "reason": "Trend-oriented default for workout progress over time.",
+        },
+        {
+            "chart_type": "bar",
+            "metric": metric_x,
+            "secondary_metric": None,
+            "dimension": base_dimension,
+            "aggregation": "avg",
+            "reason": "Category comparison for workout segments.",
+        },
+        {
+            "chart_type": "scatter",
+            "metric": metric_x,
+            "secondary_metric": metric_y,
+            "dimension": None,
+            "aggregation": None,
+            "reason": "Relationship view between two metrics.",
+        },
+        {
+            "chart_type": "histogram",
+            "metric": metric_x,
+            "secondary_metric": None,
+            "dimension": None,
+            "aggregation": None,
+            "reason": "Distribution view for a single metric.",
+        },
+    ]
+
+
+def _score_candidate_plan(plan: Dict[str, Any], rows: List[Dict[str, Any]], user_text: str) -> Tuple[float, Dict[str, Any]]:
+    chart_type = str(plan.get("chart_type") or "bar")
+    metric = str(plan.get("metric") or "duration_min")
+    secondary = str(plan.get("secondary_metric") or "")
+    dimension = str(plan.get("dimension") or "type")
+    tl = user_text.lower()
+
+    request_fit = 0.2
+    if chart_type in CHART_TYPE_HINTS and _contains_any(tl, CHART_TYPE_HINTS[chart_type]):
+        request_fit = 0.45
+    elif _contains_any(tl, GENERIC_VIZ_HINTS):
+        request_fit = 0.3
+
+    sufficiency = 0.1
+    detail: Dict[str, Any] = {}
+    if chart_type in {"line", "bar"}:
+        pts = _aggregate(rows=rows, dimension=dimension, metric=metric, agg=str(plan.get("aggregation") or "avg"))
+        sufficiency = min(0.45, len(pts) / 20.0 + 0.1)
+        detail = {"point_count": len(pts)}
+    elif chart_type == "scatter":
+        pts = _scatter_points(rows=rows, x_metric=metric, y_metric=secondary or "calories", limit=250)
+        sufficiency = min(0.45, len(pts) / 180.0 + 0.08)
+        detail = {"point_count": len(pts), "secondary_metric": secondary}
+    elif chart_type == "histogram":
+        vals = _hist_values(rows=rows, metric=metric, limit=2000)
+        sufficiency = min(0.45, len(vals) / 350.0 + 0.08)
+        detail = {"value_count": len(vals)}
+    elif chart_type == "box":
+        groups = _box_values(rows=rows, metric=metric, dimension=dimension)
+        n_obs = sum(len(g.get("values", [])) for g in groups)
+        sufficiency = min(0.45, (len(groups) / 8.0) + (n_obs / 450.0))
+        detail = {"group_count": len(groups), "value_count": n_obs}
+
+    metric_coverage = min(0.1, _count_metric_values(rows, metric) / 800.0)
+    score = round(min(0.99, request_fit + sufficiency + metric_coverage), 3)
+    detail.update(
+        {
+            "request_fit": round(request_fit, 3),
+            "sufficiency": round(sufficiency, 3),
+            "metric_coverage": round(metric_coverage, 3),
+        }
+    )
+    return score, detail
+
+
 def run_data_science_story1(req: StoryRequest) -> StoryResult:
     user_text = req.user_query or ""
     fallback_member = req.member.member_id if req.member else None
@@ -277,15 +424,29 @@ def run_data_science_story1(req: StoryRequest) -> StoryResult:
         )
 
     start_date, end_date = parse_date_range_from_text(user_text, default_weeks=8)
+    metrics_in_text = _extract_metrics_from_text(user_text)
     chart_type = _pick_chart_type(user_text)
-    primary_metric = _pick_metric(user_text, fallback="duration_min")
+    primary_metric = metrics_in_text[0] if metrics_in_text else _pick_metric(user_text, fallback="duration_min")
     dimension = _pick_dimension(user_text, chart_type=chart_type)
     agg = "avg"
     if _contains_any(user_text.lower(), ["count", "number of workouts", "how many"]):
         agg = "count"
 
-    scatter_y_metric = "calories" if primary_metric != "calories" else "duration_min"
+    scatter_y_metric = metrics_in_text[1] if len(metrics_in_text) > 1 else ("calories" if primary_metric != "calories" else "duration_min")
     assumptions: List[str] = []
+    warnings: List[str] = []
+    request_underspecified = _is_underspecified_viz_request(user_text, metrics=metrics_in_text)
+    planner_source = "deterministic_direct"
+    planner_confidence = 1.0 if _is_explicit_chart_request(user_text) else 0.7
+    plan_candidates: List[Dict[str, Any]] = []
+    selected_plan: Dict[str, Any] = {
+        "chart_type": chart_type,
+        "metric": primary_metric,
+        "secondary_metric": scatter_y_metric if chart_type == "scatter" else None,
+        "dimension": dimension,
+        "aggregation": agg if chart_type in {"line", "bar"} else None,
+    }
+    selection_rationale = "Used direct deterministic mapping from explicit chart intent."
     if not explicit_member and member_id and _is_member_scoped_request(f" {user_text.strip()} "):
         assumptions.append(f"Used member_id from conversation context: {member_id}.")
     if "last" not in user_text.lower() and "between" not in user_text.lower():
@@ -306,6 +467,75 @@ def run_data_science_story1(req: StoryRequest) -> StoryResult:
                 "date_range": {"start_date": start_date, "end_date": end_date},
             },
         )
+
+    if request_underspecified:
+        planner_source = "deterministic_candidate_planner"
+        raw_candidates = _build_candidate_plans(user_text=user_text, primary_metric=primary_metric, metrics_in_text=metrics_in_text)
+        scored: List[Dict[str, Any]] = []
+        for candidate in raw_candidates:
+            score, details = _score_candidate_plan(candidate, rows=rows, user_text=user_text)
+            scored.append({**candidate, "score": score, "score_details": details})
+        scored.sort(key=lambda c: float(c.get("score", 0.0)), reverse=True)
+        plan_candidates = scored[:4]
+        top = scored[0] if scored else selected_plan
+        second = scored[1] if len(scored) > 1 else None
+        planner_confidence = float(top.get("score", 0.0))
+        selected_plan = {
+            "chart_type": top.get("chart_type"),
+            "metric": top.get("metric"),
+            "secondary_metric": top.get("secondary_metric"),
+            "dimension": top.get("dimension"),
+            "aggregation": top.get("aggregation"),
+            "score": planner_confidence,
+        }
+        selection_rationale = str(top.get("reason") or "Selected highest-scoring visualization candidate.")
+
+        margin = planner_confidence - float(second.get("score", 0.0)) if isinstance(second, dict) else planner_confidence
+        if planner_confidence < 0.5 or margin < 0.06:
+            question = (
+                "I can build this in a few ways. Which do you prefer: trend line over time, bar by category, "
+                "scatter relationship, or histogram distribution?"
+            )
+            return StoryResult(
+                story_id=req.story_id,
+                response_text=question,
+                follow_up_question=question,
+                story_output={
+                    "needs_clarification": True,
+                    "requested_slot": "chart_type",
+                    "missing_slots": ["chart_type"],
+                    "member_id": member_id,
+                    "date_range": {"start_date": start_date, "end_date": end_date},
+                    "request_underspecified": True,
+                    "planner_source": planner_source,
+                    "planner_confidence": planner_confidence,
+                    "plan_candidates": plan_candidates,
+                    "selected_plan": selected_plan,
+                    "selection_rationale": selection_rationale,
+                },
+            )
+
+        chart_type = str(selected_plan.get("chart_type") or chart_type)
+        primary_metric = str(selected_plan.get("metric") or primary_metric)
+        if selected_plan.get("secondary_metric"):
+            scatter_y_metric = str(selected_plan.get("secondary_metric"))
+        if selected_plan.get("dimension"):
+            dimension = str(selected_plan.get("dimension"))
+        if selected_plan.get("aggregation") and chart_type in {"line", "bar"} and agg != "count":
+            agg = str(selected_plan.get("aggregation"))
+
+    if not _metric_has_values(rows, primary_metric):
+        warnings.append(f"Requested metric '{primary_metric}' had no values in this date range; used 'duration_min' instead.")
+        primary_metric = "duration_min"
+
+    if chart_type == "scatter":
+        if not _metric_has_values(rows, scatter_y_metric):
+            scatter_y_metric = "duration_min" if primary_metric != "duration_min" else "calories"
+        if not _metric_has_values(rows, scatter_y_metric):
+            chart_type = "bar"
+            dimension = "type"
+            agg = "count"
+            warnings.append("Could not build a scatter plot due to sparse metric values; returned workout counts by type.")
 
     points: Any
     interpretation: str
@@ -333,6 +563,18 @@ def run_data_science_story1(req: StoryRequest) -> StoryResult:
         )
         title = f"Box plot: {primary_metric} by {dimension}"
 
+    if isinstance(points, list) and len(points) == 0:
+        chart_type = "bar"
+        dimension = "type"
+        agg = "count"
+        points = _aggregate(rows=rows, dimension=dimension, metric=primary_metric, agg=agg)
+        title = "Fallback chart: workout counts by type"
+        interpretation = (
+            f"The requested chart had no plottable values, so I returned workout counts by {dimension} "
+            f"across {len(rows)} workouts."
+        )
+        warnings.append("Applied fallback chart because requested visualization had no plottable points.")
+
     chart_spec = _build_plotly_spec(
         chart_type=chart_type,
         metric=primary_metric,
@@ -340,10 +582,34 @@ def run_data_science_story1(req: StoryRequest) -> StoryResult:
         dimension=dimension,
         title=title,
     )
+    if not _is_valid_plotly_spec(chart_spec):
+        # Guaranteed-safe fallback spec
+        chart_spec = _build_plotly_spec(
+            chart_type="bar",
+            metric="workout_count",
+            points=_aggregate(rows=rows, dimension="type", metric="duration_min", agg="count"),
+            dimension="type",
+            title="Fallback chart: workout counts by type",
+        )
+        warnings.append("Generated fallback chart_spec after validation check failed.")
+        chart_type = "bar"
+        primary_metric = "workout_count"
+        dimension = "type"
+        agg = "count"
+
+    selected_plan = {
+        "chart_type": chart_type,
+        "metric": primary_metric,
+        "secondary_metric": scatter_y_metric if chart_type == "scatter" else None,
+        "dimension": dimension,
+        "aggregation": agg if chart_type in {"line", "bar"} else None,
+        "score": planner_confidence,
+    }
     response = (
         f"{interpretation}\n"
         f"Date range: {start_date} to {end_date}. "
         f"{'Member scope: ' + member_id + '. ' if member_id else 'Scope: all members in Data Science workouts. '}"
+        f"{'I selected this using a candidate-plan scorer for your underspecified request. ' if request_underspecified else ''}"
         f"I included a Plotly chart spec in `story_output.chart_spec`."
     )
 
@@ -361,6 +627,13 @@ def run_data_science_story1(req: StoryRequest) -> StoryResult:
             "row_count": len(rows),
             "point_count": len(points) if isinstance(points, list) else 0,
             "assumptions": assumptions,
+            "warnings": warnings,
+            "request_underspecified": request_underspecified,
+            "planner_source": planner_source,
+            "planner_confidence": planner_confidence,
+            "plan_candidates": plan_candidates,
+            "selected_plan": selected_plan,
+            "selection_rationale": selection_rationale,
             "interpretation": interpretation,
             "chart_spec": chart_spec,
             "data_preview": points[:15] if isinstance(points, list) else [],
