@@ -19,10 +19,10 @@ from ..utils import (
     register_sqlite_alnum_normalizer,
 )
 
-PROJECT_PHASE_2 = Path(__file__).resolve().parents[2]
-DB_PATH = PROJECT_PHASE_2 / "kb" / "MembershipFraud" / "membership_fraud.db"
-SECURITY_HELP_JSONL_PATH = PROJECT_PHASE_2 / "kb" / "MembershipFraud" / "security_help_kb.jsonl"
-SECURITY_HELP_CHROMA_DIR = PROJECT_PHASE_2 / "kb" / "MembershipFraud" / "security_help_chroma"
+PROJECT_PHASE_3 = Path(__file__).resolve().parents[2]
+DB_PATH = PROJECT_PHASE_3 / "kb" / "MembershipFraud" / "membership_fraud.db"
+SECURITY_HELP_JSONL_PATH = PROJECT_PHASE_3 / "kb" / "MembershipFraud" / "security_help_kb.jsonl"
+SECURITY_HELP_CHROMA_DIR = PROJECT_PHASE_3 / "kb" / "MembershipFraud" / "security_help_chroma"
 SECURITY_HELP_COLLECTION = "membership_fraud_security_help"
 
 Timeframe = Literal["most_recent", "last_7_days", "last_30_days"]

@@ -10,6 +10,7 @@ from .stories.business_marketing_story3 import run_business_marketing_story3
 from .stories.data_science_story2 import run_data_science_story2
 from .stories.membership_fraud_story1 import run_membership_fraud_story1
 from .stories.membership_fraud_story2 import run_membership_fraud_story2
+from .stories.membership_fraud_story3 import run_membership_fraud_story3
 
 StoryHandler = Callable[[StoryRequest], StoryResult]
 
@@ -117,17 +118,38 @@ STORY_CATALOG: Dict[str, StoryConfig] = {
         ],
         handler=run_membership_fraud_story2,
     ),
+    "mf_story_3": StoryConfig(
+        story_id="mf_story_3",
+        domain="membership_fraud",
+        title="Membership Tier Fit + Upgrade/Downgrade Guidance",
+        keywords=[
+            "membership tier",
+            "tier optimization",
+            "tier fit",
+            "plan fit",
+            "best plan",
+            "upgrade",
+            "downgrade",
+            "membership level",
+            "class limit",
+            "utilization",
+            "feature usage",
+            "benefits usage",
+            "should i change my plan",
+        ],
+        handler=run_membership_fraud_story3,
+    ),
 }
 
 DOMAIN_TO_STORIES: Dict[str, List[str]] = {
     "business_marketing": ["bm_story_1", "bm_story_2", "bm_story_3"],
     "data_science": ["ds_story_2"],
-    "membership_fraud": ["mf_story_1", "mf_story_2"],
+    "membership_fraud": ["mf_story_1", "mf_story_2", "mf_story_3"],
 }
 
 # Planned expansion slots for stories not yet wired.
 PLANNED_STORIES = {
     "business_marketing": [],
     "data_science": ["ds_story_1", "ds_story_3"],
-    "membership_fraud": ["mf_story_2", "mf_story_3"],
+    "membership_fraud": [],
 }

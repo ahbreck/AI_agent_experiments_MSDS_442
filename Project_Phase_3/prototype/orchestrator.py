@@ -227,13 +227,14 @@ class AgenticOrchestrator:
             "DOMAIN GUIDE:\n"
             "- business_marketing: campaign performance, campaign feedback themes, channel/segment breakdowns, weekly metrics, CTR/CAC/ROAS/spend, creative/messaging adjustments, lead prioritization, outreach drafts, template-driven follow-ups.\n"
             "- data_science: member workout analytics, training trends, heart-rate zones, performance anomalies, workout-type segmentation.\n"
-            "- membership_fraud: security alerts/risk events and account support issues such as login access, billing charges, and renewals.\n"
+            "- membership_fraud: security alerts/risk events, account support issues such as login access/billing/renewals, and membership tier-fit optimization (upgrade/downgrade guidance based on usage).\n"
             "- clarify: only when domain cannot be chosen reliably.\n"
             "\n"
             "DISAMBIGUATION RULES:\n"
             "- If query includes CTR/CAC/ROAS/campaign/channel/target segment/marketing performance, or leads/prospects/follow-up outreach, prefer business_marketing.\n"
             "- Do not route to data_science just because dates, trends, or analysis language are present.\n"
             "- DataScience usually involves workouts and often a member_id; business_marketing campaign analysis does not require member_id.\n"
+            "- Questions about membership tier fit, plan utilization, or upgrade/downgrade options should route to membership_fraud.\n"
         )
         system = (
             "You are a top-level orchestrator router.\n"
