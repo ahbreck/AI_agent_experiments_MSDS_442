@@ -1,6 +1,8 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
+import json
 import re
+from pathlib import Path
 from typing import Any, Dict, List, Literal
 
 from langchain_openai import ChatOpenAI
@@ -13,6 +15,30 @@ IssueCategory = Literal["login", "billing", "renewal", "unknown"]
 ISSUE_CATEGORIES: tuple[IssueCategory, ...] = ("login", "billing", "renewal", "unknown")
 CLASSIFY_CONFIDENCE_THRESHOLD = 0.75
 LLM_ACCEPT_THRESHOLD = 0.65
+RAG_CLASSIFY_CONFIDENCE_THRESHOLD = 0.8
+RAG_RELEVANCE_THRESHOLD = 0.35
+RAG_TOP_K = 3
+
+PROJECT_PHASE_3 = Path(__file__).resolve().parents[2]
+KB_ROOT = PROJECT_PHASE_3 / "kb" / "MembershipFraud"
+
+CATEGORY_HELP_JSONL = {
+    "login": KB_ROOT / "login_help_kb.jsonl",
+    "billing": KB_ROOT / "billing_help_kb.jsonl",
+    "renewal": KB_ROOT / "renewal_help_kb.jsonl",
+}
+
+CATEGORY_HELP_CHROMA_DIR = {
+    "login": KB_ROOT / "login_help_chroma",
+    "billing": KB_ROOT / "billing_help_chroma",
+    "renewal": KB_ROOT / "renewal_help_chroma",
+}
+
+CATEGORY_HELP_COLLECTION = {
+    "login": "membership_fraud_login_help",
+    "billing": "membership_fraud_billing_help",
+    "renewal": "membership_fraud_renewal_help",
+}
 
 QUEUE_MAP = {
     "login": "membership_support_login_queue",
@@ -67,6 +93,11 @@ class IssueClassifierOutput(BaseModel):
     rationale: str = Field(default="")
 
 
+HELP_ROWS_CACHE: Dict[str, List[Dict[str, Any]]] = {}
+HELP_STORE: Dict[str, Any] = {}
+HELP_STORE_READY: Dict[str, bool] = {}
+
+
 def _compact_description(user_text: str, max_len: int = 140) -> str:
     cleaned = re.sub(r"\s+", " ", (user_text or "").strip())
     if not cleaned:
@@ -74,6 +105,114 @@ def _compact_description(user_text: str, max_len: int = 140) -> str:
     if len(cleaned) <= max_len:
         return cleaned
     return f"{cleaned[: max_len - 3].rstrip()}..."
+
+
+def _tokenize(text: str) -> List[str]:
+    return [tok for tok in re.split(r"[^a-z0-9]+", (text or "").lower()) if len(tok) >= 3]
+
+
+def _load_category_help_rows(category: str) -> List[Dict[str, Any]]:
+    if category in HELP_ROWS_CACHE:
+        return HELP_ROWS_CACHE[category]
+
+    p = CATEGORY_HELP_JSONL.get(category)
+    if p is None or not p.exists():
+        HELP_ROWS_CACHE[category] = []
+        return HELP_ROWS_CACHE[category]
+
+    rows: List[Dict[str, Any]] = []
+    for line in p.read_text(encoding="utf-8").splitlines():
+        txt = line.strip()
+        if not txt:
+            continue
+        try:
+            obj = json.loads(txt)
+            if isinstance(obj, dict):
+                rows.append(obj)
+        except Exception:
+            continue
+    HELP_ROWS_CACHE[category] = rows
+    return rows
+
+
+def _get_category_help_store(category: str):
+    if HELP_STORE_READY.get(category):
+        return HELP_STORE.get(category)
+    HELP_STORE_READY[category] = True
+
+    chroma_dir = CATEGORY_HELP_CHROMA_DIR.get(category)
+    collection = CATEGORY_HELP_COLLECTION.get(category)
+    if chroma_dir is None or collection is None or not chroma_dir.exists():
+        HELP_STORE[category] = None
+        return None
+
+    try:
+        from langchain_chroma import Chroma
+        from langchain_openai import OpenAIEmbeddings
+    except Exception:
+        HELP_STORE[category] = None
+        return None
+
+    try:
+        HELP_STORE[category] = Chroma(
+            collection_name=collection,
+            persist_directory=str(chroma_dir),
+            embedding_function=OpenAIEmbeddings(model="text-embedding-3-small"),
+        )
+    except Exception:
+        HELP_STORE[category] = None
+    return HELP_STORE[category]
+
+
+def _retrieve_category_help(category: str, query: str, k: int = RAG_TOP_K) -> List[Dict[str, Any]]:
+    store = _get_category_help_store(category)
+    out: List[Dict[str, Any]] = []
+    if store is not None:
+        try:
+            pairs = store.similarity_search_with_score(query, k=k)
+            for doc, distance in pairs:
+                md = doc.metadata or {}
+                dist = float(distance) if distance is not None else 1.0
+                score = 1.0 / (1.0 + max(dist, 0.0))
+                out.append(
+                    {
+                        "id": md.get("id") or f"{category}-help",
+                        "question": md.get("question") or "",
+                        "answer": md.get("answer") or "",
+                        "score": score,
+                        "text": doc.page_content,
+                    }
+                )
+            if out:
+                return out
+        except Exception:
+            pass
+
+    rows = _load_category_help_rows(category)
+    if not rows:
+        return []
+
+    q_tokens = set(_tokenize(query))
+    scored: List[Dict[str, Any]] = []
+    for i, row in enumerate(rows, start=1):
+        q = str(row.get("question") or "")
+        a = str(row.get("answer") or "")
+        full = f"{q} {a}"
+        row_tokens = set(_tokenize(full))
+        overlap = len(q_tokens.intersection(row_tokens))
+        if overlap <= 0:
+            continue
+        scored.append(
+            {
+                "id": row.get("id") or f"{category}-help-{i}",
+                "question": q,
+                "answer": a,
+                "score": float(overlap) / max(len(q_tokens), 1),
+                "text": full,
+            }
+        )
+    scored.sort(key=lambda x: x.get("score", 0.0), reverse=True)
+    return scored[:k]
 
 
 def _score_categories(user_text: str) -> Dict[str, int]:
@@ -181,13 +320,27 @@ def _select_final_classification(user_text: str) -> Dict[str, Any]:
 
 
 def _route_queue(issue_category: str, confidence: float) -> tuple[str, bool]:
-    if issue_category == "unknown" or confidence < CLASSIFY_CONFIDENCE_THRESHOLD:
+    # Guardrail: if confidence is below direct-response threshold, force human review.
+    if issue_category == "unknown" or confidence < RAG_CLASSIFY_CONFIDENCE_THRESHOLD:
         return QUEUE_MAP["unknown"], True
     return QUEUE_MAP.get(issue_category, QUEUE_MAP["unknown"]), False
 
 
-def _format_response(payload: Dict[str, Any]) -> str:
-    return (
+def _build_rag_direct_answer(user_text: str, issue_category: str, snippets: List[Dict[str, Any]]) -> str:
+    if not snippets:
+        return ""
+
+    lines = ["Direct guidance from knowledge base:"]
+    for s in snippets:
+        ans = str(s.get("answer") or "").strip()
+        sid = str(s.get("id") or "kb")
+        if ans:
+            lines.append(f"- {ans} [{sid}]")
+    return "\n".join(lines)
+
+
+def _format_response(payload: Dict[str, Any], rag_direct_answer: str | None = None) -> str:
+    summary = (
         "Issue triage result:\n"
         f"- Category: {payload.get('issue_category')}\n"
         f"- Description: {payload.get('issue_description')}\n"
@@ -195,6 +348,69 @@ def _format_response(payload: Dict[str, Any]) -> str:
         f"- Routed queue: {payload.get('routing_queue')}\n"
         f"- Human review required: {'yes' if payload.get('requires_human_review') else 'no'}"
     )
+    if rag_direct_answer:
+        return f"{summary}\n\nSuggested direct response:\n{rag_direct_answer}"
+
+    rag_attempted = bool(payload.get("rag_attempted"))
+    rag_used = bool(payload.get("rag_used"))
+    rag_reason = str(payload.get("rag_fallback_reason") or "").strip()
+    if not rag_used:
+        if rag_reason == "classification_confidence_below_threshold":
+            return (
+                f"{summary}\n\n"
+                "I could not provide a direct knowledge-base response because classification confidence was below "
+                "the direct-response threshold, so this has been flagged for human review."
+            )
+        if rag_reason in {"low_relevance", "no_kb_match"}:
+            msg = "I could not find corresponding information in the issue knowledge base for a direct response."
+            if rag_attempted:
+                msg = (
+                    f"{msg} The case has been routed for human review to avoid providing unsupported guidance."
+                )
+            return f"{summary}\n\n{msg}"
+    return summary
+
+
+def _maybe_retrieve_direct_answer(
+    user_text: str,
+    issue_category: str,
+    confidence: float,
+    requires_human_review: bool,
+) -> Dict[str, Any]:
+    out = {
+        "rag_attempted": False,
+        "rag_used": False,
+        "rag_relevance_score": 0.0,
+        "rag_snippets": [],
+        "rag_direct_answer": None,
+        "rag_fallback_reason": "retrieval_not_attempted",
+        "rag_escalated_to_human_review": False,
+    }
+
+    if issue_category not in {"login", "billing", "renewal"}:
+        out["rag_fallback_reason"] = "classification_confidence_below_threshold"
+        return out
+    if requires_human_review or confidence < RAG_CLASSIFY_CONFIDENCE_THRESHOLD:
+        out["rag_fallback_reason"] = "classification_confidence_below_threshold"
+        return out
+
+    out["rag_attempted"] = True
+    snippets = _retrieve_category_help(issue_category, user_text, k=RAG_TOP_K)
+    out["rag_snippets"] = snippets
+    if not snippets:
+        out["rag_fallback_reason"] = "no_kb_match"
+        return out
+
+    top_score = float(snippets[0].get("score", 0.0))
+    out["rag_relevance_score"] = round(top_score, 2)
+    if top_score < RAG_RELEVANCE_THRESHOLD:
+        out["rag_fallback_reason"] = "low_relevance"
+        return out
+
+    out["rag_used"] = True
+    out["rag_direct_answer"] = _build_rag_direct_answer(user_text, issue_category, snippets)
+    out["rag_fallback_reason"] = ""
+    return out
 
 
 def run_membership_fraud_story2(req: StoryRequest) -> StoryResult:
@@ -202,6 +418,23 @@ def run_membership_fraud_story2(req: StoryRequest) -> StoryResult:
     category = str(selected.get("issue_category", "unknown"))
     confidence = float(selected.get("confidence", 0.0))
     queue_name, human_review = _route_queue(category, confidence)
+    rag_result = _maybe_retrieve_direct_answer(
+        user_text=req.user_query,
+        issue_category=category,
+        confidence=confidence,
+        requires_human_review=human_review,
+    )
+    if (
+        not human_review
+        and bool(rag_result.get("rag_attempted"))
+        and not bool(rag_result.get("rag_used"))
+        and str(rag_result.get("rag_fallback_reason") or "") in {"low_relevance", "no_kb_match"}
+    ):
+        queue_name = QUEUE_MAP["unknown"]
+        human_review = True
+        rag_result["rag_escalated_to_human_review"] = True
+
+    rag_snippets = rag_result.get("rag_snippets", [])
 
     story_output = {
         "issue_category": category,
@@ -212,6 +445,19 @@ def run_membership_fraud_story2(req: StoryRequest) -> StoryResult:
         "classification_source": selected.get("classification_source", "fallback"),
         "classification_rationale": selected.get("classification_rationale", "No rationale available."),
         "category_scores": selected.get("category_scores", {}),
+        "response_mode": "rag_direct_response" if rag_result.get("rag_used") else "queue_only",
+        "rag_attempted": bool(rag_result.get("rag_attempted")),
+        "rag_used": bool(rag_result.get("rag_used")),
+        "rag_relevance_score": float(rag_result.get("rag_relevance_score", 0.0)),
+        "rag_fallback_reason": str(rag_result.get("rag_fallback_reason") or ""),
+        "rag_escalated_to_human_review": bool(rag_result.get("rag_escalated_to_human_review")),
+        "rag_snippet_ids": [str(s.get("id")) for s in rag_snippets if s.get("id")],
+        "rag_snippets": rag_snippets,
+        "rag_thresholds": {
+            "classification_confidence_min": RAG_CLASSIFY_CONFIDENCE_THRESHOLD,
+            "retrieval_relevance_min": RAG_RELEVANCE_THRESHOLD,
+            "top_k": RAG_TOP_K,
+        },
         "guardrails": {
             "auto_resolve_enabled": False,
             "case_modification_enabled": False,
@@ -221,7 +467,7 @@ def run_membership_fraud_story2(req: StoryRequest) -> StoryResult:
 
     return StoryResult(
         story_id=req.story_id,
-        response_text=_format_response(story_output),
+        response_text=_format_response(story_output, rag_direct_answer=rag_result.get("rag_direct_answer")),
         story_output=story_output,
         state_updates_domain={
             "last_issue_category": category,

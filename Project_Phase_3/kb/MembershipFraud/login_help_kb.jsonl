@@ -1,0 +1,4 @@
+{"id":"login-help-001","question":"I forgot my password and cannot log in. What should I do?","answer":"Use the Forgot Password flow, reset your password, and try signing in again from the app or web login page."}
+{"id":"login-help-002","question":"I am locked out after too many login attempts.","answer":"Wait for the lockout window to expire, then reset your password before your next sign-in attempt."}
+{"id":"login-help-003","question":"I am not receiving my verification code.","answer":"Confirm your contact method is correct, check spam/junk folders, and request a new code after a short delay."}
+{"id":"login-help-004","question":"How do I secure my account after a login issue?","answer":"Change your password, enable MFA, and sign out of other active sessions if available."}

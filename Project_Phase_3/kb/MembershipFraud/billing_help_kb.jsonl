@@ -1,0 +1,4 @@
+{"id":"billing-help-001","question":"I was charged twice for my membership.","answer":"Review the invoice dates and charge IDs, then submit a duplicate-charge review request with those references."}
+{"id":"billing-help-002","question":"My payment failed even though my card works.","answer":"Verify billing address and card expiry, then retry payment or update the payment method in billing settings."}
+{"id":"billing-help-003","question":"How do I request a refund?","answer":"Open a billing support request with your member ID, invoice number, and reason for refund review."}
+{"id":"billing-help-004","question":"Why does my invoice total look different than expected?","answer":"Check tax, discounts, and plan change proration details listed on the invoice breakdown."}
