@@ -26,6 +26,7 @@ SECURITY_HELP_CHROMA_DIR = PROJECT_PHASE_3 / "kb" / "MembershipFraud" / "securit
 SECURITY_HELP_COLLECTION = "membership_fraud_security_help"
 
 Timeframe = Literal["most_recent", "last_7_days", "last_30_days"]
+IntentRoute = Literal["event_only", "howto_only", "mixed"]
 
 
 class SecurityPlan(BaseModel):
@@ -47,6 +48,11 @@ class SecurityState(TypedDict, total=False):
     recommended_actions: List[str]
     latest_event: Dict[str, Any]
     security_help_snippets: List[Dict[str, Any]]
+    intent_route: IntentRoute
+    effective_timeframe: Optional[Timeframe]
+    fallback_applied: bool
+    fallback_reason: Optional[str]
+    self_check_flags: List[str]
 
 
 def _infer_timeframe(user_text: str) -> Timeframe:
@@ -123,6 +129,37 @@ def _user_asks_security_howto(text: str) -> bool:
         or ("two-factor" in t)
     )
     return (howto and topic) or direct_password_or_mfa
+
+
+def _user_asks_event_check(text: str) -> bool:
+    t = text.lower()
+    event_signals = [
+        "security alert",
+        "alert",
+        "suspicious login",
+        "unknown login",
+        "unauthorized login",
+        "unrecognized login",
+        "new login",
+        "sign in",
+        "sign-in",
+        "login",
+        "location",
+        "device",
+        "security event",
+        "account activity",
+    ]
+    return _user_says_not_recognized(t) or _user_says_recognized(t) or any(k in t for k in event_signals)
+
+
+def _infer_intent_route(text: str) -> IntentRoute:
+    asks_howto = _user_asks_security_howto(text)
+    asks_event = _user_asks_event_check(text)
+    if asks_howto and asks_event:
+        return "mixed"
+    if asks_howto:
+        return "howto_only"
+    return "event_only"
 
 
 SECURITY_HELP_ROWS_CACHE: Optional[List[Dict[str, Any]]] = None
@@ -332,6 +369,7 @@ def _planner_node(state: SecurityState, llm: ChatOpenAI) -> SecurityState:
     existing_member_id = state.get("member_id")
     existing_timeframe = state.get("timeframe")
     fallback_timeframe = existing_timeframe or _infer_timeframe(user_text)
+    intent_route = _infer_intent_route(user_text)
 
     structured = llm.with_structured_output(SecurityPlan)
     system = (
@@ -365,7 +403,8 @@ def _planner_node(state: SecurityState, llm: ChatOpenAI) -> SecurityState:
 
     member_id = normalize_member_id(plan.get("member_id")) or existing_member_id
     timeframe = plan.get("timeframe") or fallback_timeframe
-    ask_for_member = bool(plan.get("ask_for_member_id", False) and not member_id)
+    needs_member = intent_route in {"event_only", "mixed"}
+    ask_for_member = bool(needs_member and plan.get("ask_for_member_id", False) and not member_id)
 
     if member_id:
         plan["ask_for_member_id"] = False
@@ -376,6 +415,7 @@ def _planner_node(state: SecurityState, llm: ChatOpenAI) -> SecurityState:
         "plan": plan,
         "member_id": member_id,
         "timeframe": timeframe,
+        "intent_route": intent_route,
         "follow_up_question": (
             "I can check that security alert, what is your member_id (e.g., MB001)?"
             if ask_for_member
@@ -389,13 +429,51 @@ def _retrieve_node(state: SecurityState) -> SecurityState:
     if not member_id:
         return {}
     plan = state.get("plan", {})
+    intent_route = str(state.get("intent_route") or "event_only")
     timeframe = state.get("timeframe") or "most_recent"
     max_events = int(plan.get("max_events", 3))
     events = _read_security_events(member_id=member_id, timeframe=timeframe, max_events=max_events)
-    return {"retrieved_events": events}
+    fallback_applied = False
+    fallback_reason: Optional[str] = None
+    effective_timeframe: Timeframe = timeframe
+
+    if (
+        intent_route in {"event_only", "mixed"}
+        and timeframe == "last_7_days"
+        and not events
+    ):
+        events = _read_security_events(member_id=member_id, timeframe="last_30_days", max_events=max_events)
+        fallback_applied = True
+        fallback_reason = "no_events_last_7_days"
+        effective_timeframe = "last_30_days"
+
+    return {
+        "retrieved_events": events,
+        "effective_timeframe": effective_timeframe,
+        "fallback_applied": fallback_applied,
+        "fallback_reason": fallback_reason,
+    }
 
 
 def _respond_node(state: SecurityState, llm: ChatOpenAI) -> SecurityState:
+    intent_route = str(state.get("intent_route") or "event_only")
+    user_text = state.get("user_text", "")
+
+    if intent_route == "howto_only":
+        rag = _answer_security_howto(user_text, llm)
+        if rag:
+            return {
+                "response_text": rag["message"],
+                "follow_up_question": None,
+                "security_help_snippets": rag.get("snippets", []),
+                "recommended_actions": [],
+            }
+        msg = (
+            "I can help with security steps, but I do not have enough matching guidance in the knowledge base. "
+            "Please contact support for account-specific help."
+        )
+        return {"response_text": msg, "follow_up_question": None, "security_help_snippets": []}
+
     member_id = state.get("member_id")
     if not member_id:
         msg = state.get("follow_up_question") or "What is your member_id?"
@@ -403,38 +481,23 @@ def _respond_node(state: SecurityState, llm: ChatOpenAI) -> SecurityState:
 
     events = state.get("retrieved_events") or []
     timeframe = state.get("timeframe") or "most_recent"
+    effective_timeframe = state.get("effective_timeframe") or timeframe
+    fallback_applied = bool(state.get("fallback_applied", False))
     if not events:
-        msg = f"I could not find security alerts for {member_id} in timeframe={timeframe}."
+        if fallback_applied and timeframe != effective_timeframe:
+            msg = (
+                f"I could not find security alerts for {member_id} in timeframe={timeframe}. "
+                f"I also checked timeframe={effective_timeframe} and found none."
+            )
+        else:
+            msg = f"I could not find security alerts for {member_id} in timeframe={timeframe}."
         return {"response_text": msg, "follow_up_question": None}
 
     latest = events[0]
     explanation = _explain_security_event(latest)
     actions = _guide_security_actions(latest)
-    user_text = state.get("user_text", "")
     recognized = _user_says_recognized(user_text)
     not_recognized = _user_says_not_recognized(user_text)
-    asks_howto = _user_asks_security_howto(user_text)
-
-    if asks_howto:
-        rag = _answer_security_howto(user_text, llm)
-        if rag:
-            help_msg = rag["message"]
-            if not_recognized:
-                msg = (
-                    "Because you do not recognize the login, take these actions now:\n"
-                    f"- {actions[1]}\n"
-                    f"- {actions[2] if len(actions) > 2 else 'Enable MFA for added protection.'}\n\n"
-                    f"{help_msg}"
-                )
-            else:
-                msg = help_msg
-            return {
-                "response_text": msg,
-                "follow_up_question": None,
-                "recommended_actions": actions,
-                "latest_event": latest,
-                "security_help_snippets": rag.get("snippets", []),
-            }
 
     try:
         if not_recognized:
@@ -481,13 +544,90 @@ def _respond_node(state: SecurityState, llm: ChatOpenAI) -> SecurityState:
         )
         follow_up = "Do you recognize this location or device?"
 
-    return {
+    out: SecurityState = {
         "response_text": msg,
         "follow_up_question": follow_up,
         "recommended_actions": actions,
         "latest_event": latest,
         "security_help_snippets": [],
     }
+
+    if intent_route == "mixed":
+        rag = _answer_security_howto(user_text, llm)
+        if rag:
+            out["response_text"] = f"{msg}\n\nSecurity steps:\n{rag['message']}"
+            out["security_help_snippets"] = rag.get("snippets", [])
+    return out
+
+
+def _self_check_node(state: SecurityState) -> SecurityState:
+    flags: List[str] = []
+    response_text = str(state.get("response_text") or "").strip()
+    if not response_text:
+        flags.append("empty_response")
+        response_text = "I can help with security alerts and account safety guidance."
+
+    intent_route = str(state.get("intent_route") or "event_only")
+    member_id = state.get("member_id")
+    timeframe = state.get("timeframe") or "most_recent"
+    effective_timeframe = state.get("effective_timeframe") or timeframe
+    events = state.get("retrieved_events") or []
+    latest = state.get("latest_event") or {}
+    snippets = state.get("security_help_snippets") or []
+
+    # Guardrail: avoid claiming event findings when retrieval has none.
+    if not events:
+        likely_event_claim = (
+            ("latest security alert" in response_text.lower())
+            or ("alert time:" in response_text.lower())
+            or ("- time:" in response_text.lower())
+        )
+        if likely_event_claim:
+            flags.append("event_claim_without_rows")
+            if member_id:
+                response_text = (
+                    f"I could not find security alerts for {member_id} in timeframe={timeframe}."
+                    if timeframe == effective_timeframe
+                    else (
+                        f"I could not find security alerts for {member_id} in timeframe={timeframe}. "
+                        f"I also checked timeframe={effective_timeframe} and found none."
+                    )
+                )
+            else:
+                response_text = "I could not retrieve security alerts because member_id is missing."
+
+    # Guardrail: keep how-to guidance grounded in retrieved snippets.
+    if intent_route in {"howto_only", "mixed"}:
+        snippet_ids = [str(s.get("id")) for s in snippets if s.get("id")]
+        if snippets:
+            if not any(f"[{sid}]" in response_text for sid in snippet_ids):
+                flags.append("missing_rag_citation")
+                response_text = response_text + "\n\nReferences: " + ", ".join([f"[{sid}]" for sid in snippet_ids[:3]])
+        elif intent_route == "howto_only":
+            step_like = bool(re.search(r"\b(step|first|then|next|go to|open|click)\b", response_text, flags=re.I))
+            if step_like:
+                flags.append("howto_without_snippets")
+                response_text = (
+                    "I do not have enough grounded security-help snippets for that procedure. "
+                    "Please contact support for account-specific instructions."
+                )
+
+    # Guardrail: avoid leaking null-like placeholders from model output.
+    if re.search(r"\b(None|null)\b", response_text):
+        flags.append("null_placeholder_text")
+        if latest:
+            response_text = (
+                f"Latest security alert for {member_id or 'this member'}:\n"
+                f"- Time: {latest.get('event_ts') or 'unknown'}\n"
+                f"- Location: {latest.get('login_location') or 'unknown'}\n"
+                f"- Device: {latest.get('device_type') or 'unknown'}\n"
+                f"- Reason: {latest.get('trigger_reason') or 'unknown'}\n"
+                f"- Risk: {latest.get('risk_level') or 'unknown'}"
+            )
+        else:
+            response_text = "I can help check recent security alerts or provide general security guidance."
+
+    return {"response_text": response_text, "self_check_flags": flags}
 
 
 def _build_story_graph():
@@ -503,16 +643,23 @@ def _build_story_graph():
     def respond_node(state: SecurityState) -> SecurityState:
         return _respond_node(state, llm)
 
+    def self_check_node(state: SecurityState) -> SecurityState:
+        return _self_check_node(state)
+
     def route_after_plan(state: SecurityState) -> str:
+        if str(state.get("intent_route") or "event_only") == "howto_only":
+            return "ask"
         return "ask" if state.get("follow_up_question") and not state.get("member_id") else "go"
 
     builder.add_node("plan", plan_node)
     builder.add_node("retrieve", retrieve_node)
     builder.add_node("respond", respond_node)
+    builder.add_node("self_check", self_check_node)
     builder.set_entry_point("plan")
     builder.add_conditional_edges("plan", route_after_plan, {"ask": "respond", "go": "retrieve"})
     builder.add_edge("retrieve", "respond")
-    builder.add_edge("respond", END)
+    builder.add_edge("respond", "self_check")
+    builder.add_edge("self_check", END)
     return builder.compile()
 
 
@@ -545,12 +692,21 @@ def run_membership_fraud_story1(req: StoryRequest) -> StoryResult:
     response_text = state_out.get("response_text") or "I can help with security alerts."
     final_member = state_out.get("member_id") or member_id
     final_timeframe = state_out.get("timeframe") or _infer_timeframe(req.user_query)
+    effective_timeframe = state_out.get("effective_timeframe") or final_timeframe
     retrieved_events = state_out.get("retrieved_events") or []
     follow_up = state_out.get("follow_up_question")
+    fallback_applied = bool(state_out.get("fallback_applied", False))
+    fallback_reason = state_out.get("fallback_reason")
+    self_check_flags = state_out.get("self_check_flags", [])
 
     story_output = {
         "member_id": final_member,
+        "intent_route": state_out.get("intent_route", "event_only"),
         "timeframe": final_timeframe,
+        "effective_timeframe": effective_timeframe,
+        "fallback_applied": fallback_applied,
+        "fallback_reason": fallback_reason,
+        "self_check_flags": self_check_flags,
         "plan": state_out.get("plan", {}),
         "retrieved_events": retrieved_events,
         "recommended_actions": state_out.get("recommended_actions", []),
@@ -570,7 +726,7 @@ def run_membership_fraud_story1(req: StoryRequest) -> StoryResult:
         state_updates_global={"member": {"member_id": final_member}} if final_member else {},
         state_updates_domain={
             "member_id": final_member,
-            "timeframe": final_timeframe,
+            "timeframe": effective_timeframe,
             "last_story_summary": f"Returned {len(retrieved_events)} security event(s).",
         },
     )
