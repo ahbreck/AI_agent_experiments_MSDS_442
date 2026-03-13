@@ -1121,7 +1121,7 @@ def _summarize_tool_results_for_prompt(tool_results: Dict[str, Any]) -> Dict[str
 def _maybe_llm_interpret_results(user_text: str, plan: Dict[str, Any], tool_results: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     if not os.getenv("OPENAI_API_KEY"):
         return None
-    if os.getenv("PROTOTYPE_DS_USE_LLM_INTERPRET", "1").strip().lower() not in {"1", "true", "yes"}:
+    if os.getenv("PROTOTYPE_DS2_USE_LLM_INTERPRET", "1").strip().lower() not in {"1", "true", "yes"}:
         return None
     try:
         from langchain_openai import ChatOpenAI
@@ -1142,7 +1142,7 @@ def _maybe_llm_interpret_results(user_text: str, plan: Dict[str, Any], tool_resu
         f"COMPUTED_RESULTS_SUMMARY: {json.dumps(compact_results, ensure_ascii=True)}\n"
     )
     try:
-        llm = ChatOpenAI(model=os.getenv("PROTOTYPE_DS_INTERPRET_MODEL", "gpt-4o-mini"), temperature=0.1)
+        llm = ChatOpenAI(model=os.getenv("PROTOTYPE_DS2_INTERPRET_MODEL", "gpt-4o-mini"), temperature=0.1)
         structured = llm.with_structured_output(InterpretationOutput)
         out = structured.invoke([("system", system), ("user", user)])
         if not out:
