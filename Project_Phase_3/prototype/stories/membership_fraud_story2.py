@@ -3,9 +3,10 @@
 import json
 import re
 from pathlib import Path
-from typing import Any, Dict, List, Literal
+from typing import Any, Dict, List, Literal, TypedDict
 
 from langchain_openai import ChatOpenAI
+from langgraph.graph import END, StateGraph
 from pydantic import BaseModel, Field
 
 from ..contracts import StoryRequest, StoryResult
@@ -91,6 +92,20 @@ class IssueClassifierOutput(BaseModel):
     issue_description: str = Field(default="")
     confidence: float = Field(default=0.0, ge=0.0, le=1.0)
     rationale: str = Field(default="")
+
+
+class MembershipSupportState(TypedDict, total=False):
+    user_text: str
+    deterministic_classification: Dict[str, Any]
+    final_classification: Dict[str, Any]
+    issue_category: str
+    classification_confidence: float
+    routing_queue: str
+    requires_human_review: bool
+    rag_result: Dict[str, Any]
+    story_output: Dict[str, Any]
+    response_text: str
+    audit_trace: List[str]
 
 
 HELP_ROWS_CACHE: Dict[str, List[Dict[str, Any]]] = {}
@@ -319,6 +334,10 @@ def _select_final_classification(user_text: str) -> Dict[str, Any]:
     return resolved
 
 
+def _needs_llm_resolution(base: Dict[str, Any]) -> bool:
+    return base.get("issue_category") == "unknown" or float(base.get("confidence", 0.0)) < CLASSIFY_CONFIDENCE_THRESHOLD
+
+
 def _route_queue(issue_category: str, confidence: float) -> tuple[str, bool]:
     # Guardrail: if confidence is below direct-response threshold, force human review.
     if issue_category == "unknown" or confidence < RAG_CLASSIFY_CONFIDENCE_THRESHOLD:
@@ -413,17 +432,102 @@ def _maybe_retrieve_direct_answer(
     return out
 
 
-def run_membership_fraud_story2(req: StoryRequest) -> StoryResult:
-    selected = _select_final_classification(req.user_query)
+def _append_trace(state: MembershipSupportState, message: str) -> List[str]:
+    trace = list(state.get("audit_trace", []))
+    trace.append(message)
+    return trace
+
+
+def _parse_request_node(state: MembershipSupportState) -> MembershipSupportState:
+    user_text = str(state.get("user_text") or "").strip()
+    return {
+        "user_text": user_text,
+        "audit_trace": _append_trace(state, "parse_request: accepted user query."),
+    }
+
+
+def _classify_deterministic_node(state: MembershipSupportState) -> MembershipSupportState:
+    user_text = state.get("user_text", "")
+    base = _classify_issue_deterministic(user_text)
+    return {
+        "deterministic_classification": base,
+        "audit_trace": _append_trace(
+            state,
+            (
+                "classify_deterministic: "
+                f"category={base.get('issue_category')} confidence={float(base.get('confidence', 0.0)):.2f}"
+            ),
+        ),
+    }
+
+
+def _route_after_deterministic(state: MembershipSupportState) -> str:
+    base = state.get("deterministic_classification", {})
+    return "llm" if _needs_llm_resolution(base) else "route"
+
+
+def _classify_with_llm_node(state: MembershipSupportState) -> MembershipSupportState:
+    user_text = state.get("user_text", "")
+    base = state.get("deterministic_classification", _classify_issue_deterministic(user_text))
+    resolved = _resolve_issue_with_llm(user_text, base)
+    if resolved.get("issue_category") == "unknown" and base.get("issue_category") != "unknown":
+        resolved = base
+    return {
+        "final_classification": resolved,
+        "audit_trace": _append_trace(
+            state,
+            (
+                "classify_with_llm: "
+                f"selected={resolved.get('issue_category')} source={resolved.get('classification_source')}"
+            ),
+        ),
+    }
+
+
+def _route_queue_node(state: MembershipSupportState) -> MembershipSupportState:
+    selected = state.get("final_classification") or state.get("deterministic_classification") or {}
     category = str(selected.get("issue_category", "unknown"))
     confidence = float(selected.get("confidence", 0.0))
     queue_name, human_review = _route_queue(category, confidence)
+    return {
+        "final_classification": selected,
+        "issue_category": category,
+        "classification_confidence": confidence,
+        "routing_queue": queue_name,
+        "requires_human_review": human_review,
+        "audit_trace": _append_trace(
+            state,
+            (
+                "route_queue: "
+                f"queue={queue_name} human_review={'yes' if human_review else 'no'} confidence={confidence:.2f}"
+            ),
+        ),
+    }
+
+
+def _retrieve_kb_node(state: MembershipSupportState) -> MembershipSupportState:
     rag_result = _maybe_retrieve_direct_answer(
-        user_text=req.user_query,
-        issue_category=category,
-        confidence=confidence,
-        requires_human_review=human_review,
+        user_text=state.get("user_text", ""),
+        issue_category=str(state.get("issue_category", "unknown")),
+        confidence=float(state.get("classification_confidence", 0.0)),
+        requires_human_review=bool(state.get("requires_human_review")),
     )
+    return {
+        "rag_result": rag_result,
+        "audit_trace": _append_trace(
+            state,
+            (
+                "retrieve_kb: "
+                f"attempted={bool(rag_result.get('rag_attempted'))} used={bool(rag_result.get('rag_used'))}"
+            ),
+        ),
+    }
+
+
+def _guardrails_node(state: MembershipSupportState) -> MembershipSupportState:
+    queue_name = str(state.get("routing_queue", QUEUE_MAP["unknown"]))
+    human_review = bool(state.get("requires_human_review"))
+    rag_result = dict(state.get("rag_result", {}))
     if (
         not human_review
         and bool(rag_result.get("rag_attempted"))
@@ -433,15 +537,33 @@ def run_membership_fraud_story2(req: StoryRequest) -> StoryResult:
         queue_name = QUEUE_MAP["unknown"]
         human_review = True
         rag_result["rag_escalated_to_human_review"] = True
-
-    rag_snippets = rag_result.get("rag_snippets", [])
-
-    story_output = {
-        "issue_category": category,
-        "issue_description": selected.get("issue_description") or _compact_description(req.user_query),
-        "classification_confidence": round(confidence, 2),
+    return {
         "routing_queue": queue_name,
         "requires_human_review": human_review,
+        "rag_result": rag_result,
+        "audit_trace": _append_trace(
+            state,
+            (
+                "guardrails: "
+                f"queue={queue_name} human_review={'yes' if human_review else 'no'} "
+                f"fallback={str(rag_result.get('rag_fallback_reason') or 'none')}"
+            ),
+        ),
+    }
+
+
+def _compose_response_node(state: MembershipSupportState) -> MembershipSupportState:
+    selected = state.get("final_classification") or state.get("deterministic_classification") or {}
+    category = str(state.get("issue_category", selected.get("issue_category", "unknown")))
+    confidence = float(state.get("classification_confidence", selected.get("confidence", 0.0)))
+    rag_result = state.get("rag_result", {})
+    rag_snippets = rag_result.get("rag_snippets", [])
+    story_output = {
+        "issue_category": category,
+        "issue_description": selected.get("issue_description") or _compact_description(state.get("user_text", "")),
+        "classification_confidence": round(confidence, 2),
+        "routing_queue": state.get("routing_queue", QUEUE_MAP["unknown"]),
+        "requires_human_review": bool(state.get("requires_human_review")),
         "classification_source": selected.get("classification_source", "fallback"),
         "classification_rationale": selected.get("classification_rationale", "No rationale available."),
         "category_scores": selected.get("category_scores", {}),
@@ -463,17 +585,70 @@ def run_membership_fraud_story2(req: StoryRequest) -> StoryResult:
             "case_modification_enabled": False,
             "confidence_threshold": CLASSIFY_CONFIDENCE_THRESHOLD,
         },
+        "audit_trace": state.get("audit_trace", []),
     }
+    response_text = _format_response(story_output, rag_direct_answer=rag_result.get("rag_direct_answer"))
+    return {
+        "story_output": story_output,
+        "response_text": response_text,
+        "audit_trace": _append_trace(state, "compose_response: finalized response payload."),
+    }
+
+
+def _build_story_graph():
+    g = StateGraph(MembershipSupportState)
+    g.add_node("parse_request", _parse_request_node)
+    g.add_node("classify_deterministic", _classify_deterministic_node)
+    g.add_node("classify_with_llm", _classify_with_llm_node)
+    g.add_node("route_queue", _route_queue_node)
+    g.add_node("retrieve_kb", _retrieve_kb_node)
+    g.add_node("guardrails", _guardrails_node)
+    g.add_node("compose_response", _compose_response_node)
+    g.set_entry_point("parse_request")
+    g.add_edge("parse_request", "classify_deterministic")
+    g.add_conditional_edges("classify_deterministic", _route_after_deterministic, {"llm": "classify_with_llm", "route": "route_queue"})
+    g.add_edge("classify_with_llm", "route_queue")
+    g.add_edge("route_queue", "retrieve_kb")
+    g.add_edge("retrieve_kb", "guardrails")
+    g.add_edge("guardrails", "compose_response")
+    g.add_edge("compose_response", END)
+    return g.compile()
+
+
+MEMBERSHIP_SUPPORT_GRAPH = None
+
+
+def _get_membership_support_graph():
+    global MEMBERSHIP_SUPPORT_GRAPH
+    if MEMBERSHIP_SUPPORT_GRAPH is None:
+        MEMBERSHIP_SUPPORT_GRAPH = _build_story_graph()
+    return MEMBERSHIP_SUPPORT_GRAPH
+
+
+def get_membership_fraud_story2_mermaid() -> str:
+    return _get_membership_support_graph().get_graph().draw_mermaid()
+
+
+def run_membership_fraud_story2(req: StoryRequest) -> StoryResult:
+    state_in: MembershipSupportState = {
+        "user_text": req.user_query,
+        "audit_trace": [],
+    }
+    state_out = _get_membership_support_graph().invoke(state_in)
+    story_output = state_out.get("story_output", {})
+    category = str(story_output.get("issue_category", "unknown"))
+    queue_name = str(story_output.get("routing_queue", QUEUE_MAP["unknown"]))
+    response_text = state_out.get("response_text") or "Issue triage result: unable to format response."
 
     return StoryResult(
         story_id=req.story_id,
-        response_text=_format_response(story_output, rag_direct_answer=rag_result.get("rag_direct_answer")),
+        response_text=response_text,
         story_output=story_output,
         state_updates_domain={
             "last_issue_category": category,
             "last_issue_queue": queue_name,
             "last_story_summary": (
-                f"Triage classified '{category}' with confidence={story_output['classification_confidence']:.2f}."
+                f"Triage classified '{category}' with confidence={float(story_output.get('classification_confidence', 0.0)):.2f}."
             ),
         },
     )

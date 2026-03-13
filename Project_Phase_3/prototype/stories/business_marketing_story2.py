@@ -9,7 +9,10 @@ from pathlib import Path
 from typing import Any, Dict, List, Literal, Optional, Sequence, Tuple, TypedDict
 
 from langchain_openai import ChatOpenAI
-from langchain_core.runnables.graph_mermaid import MermaidDrawMethod
+try:
+    from langchain_core.runnables.graph import MermaidDrawMethod
+except Exception:  # pragma: no cover - backward compatibility for older langchain-core
+    from langchain_core.runnables.graph_mermaid import MermaidDrawMethod
 from langgraph.graph import END, StateGraph
 from pydantic import BaseModel, Field
 from ..contracts import StoryRequest, StoryResult

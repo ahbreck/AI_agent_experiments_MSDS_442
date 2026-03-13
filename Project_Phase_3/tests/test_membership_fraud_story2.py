@@ -182,6 +182,57 @@ class TestMembershipFraudStory2(unittest.TestCase):
         self.assertIn("billing-help-004", out.response_text)
         self.assertIn("tax, discounts, and plan change proration", out.response_text)
 
+    def test_low_confidence_query_uses_llm_resolution_path(self):
+        mocked_llm = {
+            "issue_category": "billing",
+            "issue_description": "Need refund",
+            "confidence": 0.88,
+            "classification_source": "llm",
+            "classification_rationale": "LLM disambiguated short query.",
+            "category_scores": {"login": 0, "billing": 1, "renewal": 0},
+        }
+        snippets = [
+            {
+                "id": "billing-help-200",
+                "question": "Refund request",
+                "answer": "Open billing history and submit a refund request from the charge details page.",
+                "score": 0.9,
+                "text": "Refund request instructions",
+            }
+        ]
+        with patch("prototype.stories.membership_fraud_story2._resolve_issue_with_llm", return_value=mocked_llm) as resolver, patch(
+            "prototype.stories.membership_fraud_story2._retrieve_category_help", return_value=snippets
+        ):
+            out = self._invoke("Need refund.")
+        payload = out.story_output
+        self.assertTrue(resolver.called)
+        self.assertEqual(payload.get("issue_category"), "billing")
+        self.assertEqual(payload.get("classification_source"), "llm")
+        self.assertFalse(payload.get("requires_human_review"))
+
+    def test_out_of_scope_issue_routes_human_without_rag_attempt(self):
+        with patch("prototype.stories.membership_fraud_story2._retrieve_category_help") as retriever:
+            out = self._invoke("How do I change my profile photo?")
+        payload = out.story_output
+        self.assertEqual(payload.get("issue_category"), "unknown")
+        self.assertTrue(payload.get("requires_human_review"))
+        self.assertFalse(payload.get("rag_attempted"))
+        self.assertEqual(payload.get("rag_fallback_reason"), "classification_confidence_below_threshold")
+        retriever.assert_not_called()
+
+    def test_story_output_includes_graph_audit_trace(self):
+        out = self._invoke("I was charged twice and need a refund on my latest invoice.")
+        payload = out.story_output
+        trace = payload.get("audit_trace")
+        self.assertIsInstance(trace, list)
+        self.assertGreaterEqual(len(trace), 5)
+        trace_text = " ".join(str(t) for t in trace)
+        self.assertIn("parse_request", trace_text)
+        self.assertIn("classify_deterministic", trace_text)
+        self.assertIn("route_queue", trace_text)
+        self.assertIn("retrieve_kb", trace_text)
+        self.assertIn("guardrails", trace_text)
+
 
 if __name__ == "__main__":
     unittest.main()
