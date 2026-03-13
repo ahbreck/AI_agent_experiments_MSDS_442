@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import re
 import sqlite3
 from collections import defaultdict
@@ -41,6 +42,8 @@ METRIC_META = {
 }
 
 BUSINESS_MARKETING_STORY2_GRAPH = None
+STORY2_STATE_KEY = "bm_story_2_state"
+MAX_REPLAN_ITERATIONS = 1
 
 
 class IntentClassifierOutput(BaseModel):
@@ -48,6 +51,30 @@ class IntentClassifierOutput(BaseModel):
     confidence: float = Field(default=0.0, ge=0.0, le=1.0)
     rationale: str = Field(default="")
     concise: bool = Field(default=False)
+
+
+class GroundedNarrativeOutput(BaseModel):
+    narrative: str = Field(default="")
+    confidence: float = Field(default=0.0, ge=0.0, le=1.0)
+    used_fields: List[str] = Field(default_factory=list)
+
+
+class ScopePlannerOutput(BaseModel):
+    intent: Literal["underperformers_only", "compare_metrics", "overview", "definitions"]
+    metrics_requested: List[str] = Field(default_factory=list)
+    group_by: List[str] = Field(default_factory=list)
+    ask_clarification: bool = Field(default=False)
+    follow_up_question: str = Field(default="")
+    concise: bool = Field(default=False)
+    rationale: str = Field(default="")
+    confidence: float = Field(default=0.0, ge=0.0, le=1.0)
+
+
+class CriticDecisionOutput(BaseModel):
+    action: Literal["continue", "replan_once", "ask_user"]
+    follow_up_question: str = Field(default="")
+    rationale: str = Field(default="")
+    confidence: float = Field(default=0.0, ge=0.0, le=1.0)
 
 
 def _to_float(value: Any) -> Optional[float]:
@@ -784,8 +811,61 @@ def _format_response(payload: Dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
-def run_business_marketing_story2(req: StoryRequest) -> StoryResult:
-    user_text = req.user_query or ""
+class Story2GraphState(TypedDict, total=False):
+    user_query: str
+    domain_context: Dict[str, Any]
+    user_turn_number: int
+    lower_text: str
+    glossary_only: bool
+    analysis_signals: bool
+    intent: str
+    concise: bool
+    intent_info: Dict[str, Any]
+    metric_defs: Dict[str, str]
+    group_by: List[str]
+    group_by_explicit: bool
+    unavailable_dimensions: List[str]
+    filters: Dict[str, Any]
+    metrics_explicit: List[str]
+    metrics_requested: List[str]
+    planner_source: str
+    planner_confidence: float
+    planner_rationale: str
+    memory_applied_fields: List[str]
+    available_weeks: List[str]
+    timeframe: Dict[str, Any]
+    assumptions: List[str]
+    rows: List[Dict[str, Any]]
+    prior_rows: List[Dict[str, Any]]
+    summary: Dict[str, Any]
+    quality: Dict[str, Any]
+    clean_summary: Dict[str, Any]
+    underperformers: List[Dict[str, Any]]
+    replan_count: int
+    critic_action: str
+    critic_reason: str
+    critic_confidence: float
+    follow_up_question: str
+    requested_slot: str
+    missing_slots: List[str]
+    narrative_text: str
+    narrative_source: str
+    narrative_confidence: float
+    response_text: str
+    story_output: Dict[str, Any]
+    state_summary: str
+
+
+def _user_turn_number(messages: List[Dict[str, Any]]) -> int:
+    turns = 0
+    for m in messages or []:
+        if str(m.get("role", "")).strip().lower() == "user":
+            turns += 1
+    return turns + 1
+
+
+def _classify_intent_node(state: Story2GraphState) -> Story2GraphState:
+    user_text = state.get("user_query", "")
     lower_text = user_text.lower()
     glossary_only = bool(re.search(r"\b(define|definition|what is|what are|mean(?:ing)?|glossary)\b", lower_text))
     analysis_signals = bool(
@@ -798,52 +878,404 @@ def run_business_marketing_story2(req: StoryRequest) -> StoryResult:
     intent = str(intent_info.get("intent", "overview"))
     concise = bool(intent_info.get("concise", False))
     metric_defs = _select_metric_definitions(user_text) if (glossary_only or intent == "definitions") else {}
+    return {
+        "lower_text": lower_text,
+        "glossary_only": glossary_only,
+        "analysis_signals": analysis_signals,
+        "intent_info": intent_info,
+        "intent": intent,
+        "concise": concise,
+        "metric_defs": metric_defs,
+    }
 
+
+def _route_after_classify(state: Story2GraphState) -> str:
+    if state.get("intent") == "definitions" or (state.get("glossary_only") and not state.get("analysis_signals")):
+        return "format"
+    return "go"
+
+
+def _extract_scope_node(state: Story2GraphState) -> Story2GraphState:
+    user_text = state.get("user_query", "")
+    intent = str(state.get("intent", "overview"))
+    explicit_group_by = _requested_grouping(user_text)
+    group_by = list(explicit_group_by)
+    if intent == "compare_metrics" and not explicit_group_by:
+        group_by = ["campaign_id"]
+    metrics_explicit = _requested_metrics(user_text)
+    return {
+        "group_by": group_by,
+        "group_by_explicit": bool(explicit_group_by),
+        "unavailable_dimensions": _requested_unavailable_dimensions(user_text),
+        "filters": _extract_filters(user_text, grouped_by=group_by),
+        "metrics_explicit": metrics_explicit,
+        "metrics_requested": metrics_explicit or _default_metrics_for_intent(intent),
+        "planner_source": "deterministic_scope",
+        "planner_confidence": 1.0 if metrics_explicit or group_by else 0.7,
+        "planner_rationale": "Deterministic scope extraction from user query.",
+    }
+
+
+def _is_follow_up_like(user_text: str, user_turn_number: int, prior_turn: int) -> bool:
+    text = (user_text or "").strip().lower()
+    if not text:
+        return False
+    tokens = [t for t in re.split(r"\s+", text) if t]
+    deictic = bool(re.search(r"\b(same|that|those|it|also|instead|keep|use previous|as above)\b", text))
+    short_turn = len(tokens) <= 14
+    close_turn = prior_turn > 0 and (user_turn_number - prior_turn) <= 2
+    return (short_turn and close_turn) or deictic
+
+
+def _merge_with_prior_scope_node(state: Story2GraphState) -> Story2GraphState:
+    domain_context = state.get("domain_context", {}) or {}
+    prior_state = domain_context.get(STORY2_STATE_KEY)
+    if not isinstance(prior_state, dict):
+        return {"memory_applied_fields": []}
+
+    prior_scope = prior_state.get("last_resolved_scope")
+    if not isinstance(prior_scope, dict):
+        return {"memory_applied_fields": []}
+
+    user_turn = int(state.get("user_turn_number", 0) or 0)
+    prior_turn = int(prior_state.get("last_user_turn_number", 0) or 0)
+    user_text = str(state.get("user_query", "") or "")
+    if not _is_follow_up_like(user_text, user_turn_number=user_turn, prior_turn=prior_turn):
+        return {"memory_applied_fields": []}
+
+    applied: List[str] = []
+    updates: Dict[str, Any] = {"memory_applied_fields": applied}
+
+    if not state.get("metrics_explicit") and isinstance(prior_scope.get("metrics_requested"), list):
+        prior_metrics = _valid_metric_list(prior_scope.get("metrics_requested", []))
+        if prior_metrics:
+            updates["metrics_requested"] = prior_metrics
+            applied.append("metrics_requested")
+
+    if not bool(state.get("group_by_explicit")) and isinstance(prior_scope.get("group_by"), list):
+        prior_group = _valid_group_list(prior_scope.get("group_by", []))
+        if prior_group:
+            updates["group_by"] = prior_group
+            applied.append("group_by")
+
+    current_filters = state.get("filters", {}) or {}
+    has_explicit_filters = any(current_filters.get(k) for k in ["campaign_ids", "channels", "target_segments", "objectives"])
+    prior_filters = prior_scope.get("filters")
+    if (not has_explicit_filters) and isinstance(prior_filters, dict) and any(
+        prior_filters.get(k) for k in ["campaign_ids", "channels", "target_segments", "objectives"]
+    ):
+        updates["filters"] = {
+            "campaign_ids": prior_filters.get("campaign_ids"),
+            "channels": prior_filters.get("channels"),
+            "target_segments": prior_filters.get("target_segments"),
+            "objectives": prior_filters.get("objectives"),
+        }
+        applied.append("filters")
+
+    if float((state.get("intent_info") or {}).get("confidence", 0.0)) < 0.75 and str(prior_scope.get("intent", "")) in INTENT_TYPES:
+        updates["intent"] = str(prior_scope.get("intent"))
+        applied.append("intent")
+
+    if applied:
+        existing_assumptions = list(state.get("assumptions", []))
+        existing_assumptions.append(f"Used prior Story 2 context for: {', '.join(applied)}.")
+        updates["assumptions"] = existing_assumptions
+    return updates
+
+
+def _valid_metric_list(raw: Sequence[str]) -> List[str]:
+    allowed = set(METRIC_META.keys())
+    dedup: List[str] = []
+    for m in raw:
+        key = str(m).strip().lower()
+        if key in allowed and key not in dedup:
+            dedup.append(key)
+    return dedup
+
+
+def _valid_group_list(raw: Sequence[str]) -> List[str]:
+    allowed = set(AVAILABLE_GROUPINGS)
+    dedup: List[str] = []
+    for g in raw:
+        key = str(g).strip().lower()
+        if key in allowed and key not in dedup:
+            dedup.append(key)
+    return dedup
+
+
+def _should_try_llm_scope_plan(state: Story2GraphState) -> bool:
+    if os.getenv("PROTOTYPE_BM2_USE_LLM_PLAN", "1").strip().lower() in {"0", "false", "no"}:
+        return False
+    intent_conf = float((state.get("intent_info") or {}).get("confidence", 0.0))
+    if intent_conf < 0.85:
+        return True
+    if not state.get("metrics_explicit") or not state.get("group_by"):
+        return True
+    return False
+
+
+def _maybe_llm_scope_plan(state: Story2GraphState) -> Optional[Dict[str, Any]]:
+    if not _should_try_llm_scope_plan(state):
+        return None
+    user_text = state.get("user_query", "")
+    deterministic_scope = {
+        "intent": state.get("intent"),
+        "metrics_requested": state.get("metrics_requested", []),
+        "group_by": state.get("group_by", []),
+        "filters": state.get("filters", {}),
+    }
+    try:
+        llm = ChatOpenAI(model=os.getenv("PROTOTYPE_BM2_PLAN_MODEL", "gpt-4o-mini"), temperature=0)
+        structured = llm.with_structured_output(ScopePlannerOutput)
+        system = (
+            "You are a planning assistant for weekly marketing KPI analysis.\n"
+            "Output only schema-compliant structured data.\n"
+            "Only use allowed metrics: click_through_rate, customer_acquisition_cost, return_on_ad_spend, spend.\n"
+            "Only use allowed group_by values: campaign_id, channel, target_segment, week_start.\n"
+            "Set ask_clarification true only when the request is too ambiguous to proceed safely."
+        )
+        user = f"USER_QUERY: {user_text}\nDETERMINISTIC_SCOPE: {deterministic_scope}"
+        out = structured.invoke([("system", system), ("user", user)])
+        return out.model_dump()
+    except Exception:
+        return None
+
+
+def _plan_with_llm_node(state: Story2GraphState) -> Story2GraphState:
+    llm_plan = _maybe_llm_scope_plan(state)
+    if not llm_plan:
+        return {
+            "planner_source": "deterministic_scope",
+            "planner_confidence": float(state.get("planner_confidence", 0.7)),
+            "planner_rationale": str(state.get("planner_rationale", "LLM planner unavailable or skipped.")),
+        }
+
+    llm_conf = float(llm_plan.get("confidence", 0.0))
+    if llm_conf < 0.62:
+        return {
+            "planner_source": "deterministic_scope_low_llm_confidence",
+            "planner_confidence": round(llm_conf, 2),
+            "planner_rationale": str(llm_plan.get("rationale") or "LLM planner confidence below acceptance threshold."),
+        }
+
+    planned_metrics = _valid_metric_list(llm_plan.get("metrics_requested", []))
+    planned_group = _valid_group_list(llm_plan.get("group_by", []))
+    planned_intent = str(llm_plan.get("intent") or state.get("intent", "overview"))
+    if planned_intent not in INTENT_TYPES:
+        planned_intent = str(state.get("intent", "overview"))
+
+    out: Dict[str, Any] = {
+        "planner_source": "llm_scope_plan",
+        "planner_confidence": round(llm_conf, 2),
+        "planner_rationale": str(llm_plan.get("rationale") or "LLM planner accepted."),
+        "intent": planned_intent,
+        "concise": bool(llm_plan.get("concise", state.get("concise", False))),
+    }
+    if planned_metrics:
+        out["metrics_requested"] = planned_metrics
+    if planned_group:
+        out["group_by"] = planned_group
+
+    ask_clarification = bool(llm_plan.get("ask_clarification", False))
+    question = str(llm_plan.get("follow_up_question", "")).strip()
+    if ask_clarification and question:
+        out["follow_up_question"] = question
+        out["requested_slot"] = "analysis_scope"
+        out["missing_slots"] = ["analysis_scope"]
+    return out
+
+
+def _maybe_llm_critic_decision(state: Story2GraphState) -> Optional[Dict[str, Any]]:
+    try:
+        llm = ChatOpenAI(model=os.getenv("PROTOTYPE_BM2_CRITIC_MODEL", "gpt-4o-mini"), temperature=0)
+        structured = llm.with_structured_output(CriticDecisionOutput)
+        summary_rows = ((state.get("summary") or {}).get("rows") or [])[:3]
+        quality = state.get("quality", {})
+        user = {
+            "user_query": state.get("user_query", ""),
+            "row_count": len(state.get("rows", [])),
+            "group_by": state.get("group_by", []),
+            "metrics_requested": state.get("metrics_requested", []),
+            "filters": state.get("filters", {}),
+            "quality": {
+                "invalid_ctr_rows": quality.get("invalid_ctr_rows", 0),
+                "null_cac_rows": quality.get("null_cac_rows", 0),
+                "null_roas_rows": quality.get("null_roas_rows", 0),
+                "excluded_from_thresholding": quality.get("excluded_from_thresholding", 0),
+                "valid_threshold_rows": quality.get("valid_threshold_rows", 0),
+            },
+            "summary_rows_sample": summary_rows,
+            "replan_count": int(state.get("replan_count", 0)),
+            "max_replans": MAX_REPLAN_ITERATIONS,
+        }
+        system = (
+            "You are a critic for a marketing analysis plan.\n"
+            "Choose action from: continue, replan_once, ask_user.\n"
+            "Use replan_once only if one simple scope adjustment likely improves usefulness.\n"
+            "Never choose replan_once when replan_count >= max_replans.\n"
+            "Use ask_user when ambiguity is unresolved and cannot be safely inferred."
+        )
+        out = structured.invoke([("system", system), ("user", str(user))])
+        return out.model_dump()
+    except Exception:
+        return None
+
+
+def _critic_node(state: Story2GraphState) -> Story2GraphState:
+    replan_count = int(state.get("replan_count", 0))
+    row_count = len(state.get("rows", []))
+    quality = state.get("quality", {})
+
+    # Deterministic critic baseline.
+    action = "continue"
+    reason = "Data quality and coverage are sufficient for threshold evaluation."
+    confidence = 0.75
+    question = ""
+
+    if row_count == 0:
+        action = "ask_user"
+        reason = "No rows matched the current filters/timeframe."
+        confidence = 0.92
+        question = "I found no matching weekly rows. Should I widen to the latest 8 weeks and remove filters?"
+    elif (
+        replan_count < MAX_REPLAN_ITERATIONS
+        and row_count < 6
+        and str(state.get("intent", "overview")) in {"overview", "compare_metrics"}
+    ):
+        action = "replan_once"
+        reason = "Sample size is small; widening scope once may improve signal."
+        confidence = 0.82
+    elif (
+        replan_count < MAX_REPLAN_ITERATIONS
+        and int(quality.get("excluded_from_thresholding", 0)) == row_count
+        and row_count > 0
+    ):
+        action = "replan_once"
+        reason = "All rows were excluded from thresholding; trying one broader read."
+        confidence = 0.86
+
+    llm_out = _maybe_llm_critic_decision(state)
+    if llm_out:
+        llm_conf = float(llm_out.get("confidence", 0.0))
+        llm_action = str(llm_out.get("action", "")).strip()
+        if llm_conf >= 0.65 and llm_action in {"continue", "replan_once", "ask_user"}:
+            if llm_action == "replan_once" and replan_count >= MAX_REPLAN_ITERATIONS:
+                llm_action = "continue"
+            action = llm_action
+            reason = str(llm_out.get("rationale") or reason)
+            confidence = llm_conf
+            if llm_action == "ask_user":
+                llm_q = str(llm_out.get("follow_up_question") or "").strip()
+                if llm_q:
+                    question = llm_q
+
+    out: Dict[str, Any] = {
+        "critic_action": action,
+        "critic_reason": reason,
+        "critic_confidence": round(confidence, 2),
+    }
+    if action == "ask_user":
+        out["follow_up_question"] = question or "Can you clarify your preferred scope so I can continue?"
+        out["requested_slot"] = "analysis_scope"
+        out["missing_slots"] = ["analysis_scope"]
+    return out
+
+
+def _route_after_critic(state: Story2GraphState) -> str:
+    action = str(state.get("critic_action", "continue"))
+    replan_count = int(state.get("replan_count", 0))
+    if action == "ask_user":
+        return "ask"
+    if action == "replan_once" and replan_count < MAX_REPLAN_ITERATIONS:
+        return "replan"
+    return "threshold"
+
+
+def _replan_scope_node(state: Story2GraphState) -> Story2GraphState:
+    replan_count = int(state.get("replan_count", 0)) + 1
+    group_by = list(state.get("group_by", []))
+    metrics = list(state.get("metrics_requested", []))
+    filters = dict(state.get("filters", {}))
+    assumptions = list(state.get("assumptions", []))
+
+    if not group_by:
+        group_by = ["campaign_id"]
+        assumptions.append("Critic replan: added campaign_id grouping for clearer comparison.")
+    elif "week_start" not in group_by and len(group_by) < 2:
+        group_by = group_by + ["week_start"]
+        assumptions.append("Critic replan: added week_start grouping to increase trend visibility.")
+
+    if not metrics:
+        metrics = ["click_through_rate", "customer_acquisition_cost", "return_on_ad_spend"]
+        assumptions.append("Critic replan: restored core KPI metrics.")
+
+    if len(state.get("rows", [])) == 0 and any(filters.get(k) for k in ["campaign_ids", "channels", "target_segments", "objectives"]):
+        filters = {"campaign_ids": None, "channels": None, "target_segments": None, "objectives": None}
+        assumptions.append("Critic replan: removed restrictive filters after zero-row read.")
+
+    return {
+        "replan_count": replan_count,
+        "group_by": group_by,
+        "metrics_requested": metrics,
+        "filters": filters,
+        "assumptions": assumptions,
+        "planner_source": "critic_replan",
+        "planner_rationale": "Applied one critic-guided scope adjustment.",
+    }
+
+
+def _route_after_extract_scope(state: Story2GraphState) -> str:
+    if str(state.get("follow_up_question", "")).strip():
+        return "ask"
+    text = state.get("lower_text", "")
+    has_timeframe = bool(re.search(r"\b(last|week|weeks|month|quarter|between|from|since|latest)\b", text)) or bool(
+        re.search(r"\b\d{4}-\d{2}-\d{2}\b", text)
+    )
+    has_group = bool(state.get("group_by"))
+    has_metrics = bool(state.get("metrics_explicit"))
+    intent = str(state.get("intent", "overview"))
+    conf = float((state.get("intent_info") or {}).get("confidence", 0.0))
+    if intent == "overview" and conf < 0.7 and not has_timeframe and not has_group and not has_metrics:
+        return "ask"
+    return "go"
+
+
+def _clarify_request_node(state: Story2GraphState) -> Story2GraphState:
+    question = str(state.get("follow_up_question", "")).strip()
+    if not question:
+        question = (
+            "I can run this, but I need one detail first: do you want an overview, a comparison, "
+            "or only underperformers for a specific timeframe (for example, last 4 weeks)?"
+        )
+    return {
+        "follow_up_question": question,
+        "requested_slot": "analysis_scope",
+        "missing_slots": ["analysis_scope"],
+    }
+
+
+def _read_metrics_node(state: Story2GraphState) -> Story2GraphState:
+    user_text = state.get("user_query", "")
+    filters = state.get("filters", {})
     with sqlite3.connect(DB_PATH) as conn:
         register_sqlite_alnum_normalizer(conn)
         _ensure_threshold_table(conn)
         available_weeks = _get_available_weeks(conn)
-
         timeframe = convert_weekly(user_text, available_weeks)
-        group_by = _requested_grouping(user_text)
-        if intent == "compare_metrics" and not group_by:
-            group_by = ["campaign_id"]
-        unavailable_dimensions = _requested_unavailable_dimensions(user_text)
-        filters = _extract_filters(user_text, grouped_by=group_by)
-        metrics_explicit = _requested_metrics(user_text)
-        metrics = metrics_explicit or _default_metrics_for_intent(intent)
         assumptions = [timeframe["assumption"]] if timeframe.get("assumption") else []
-
-        if intent == "definitions" or (glossary_only and not analysis_signals):
-            response_text = _format_response({"glossary_only": True, "metric_defs": metric_defs})
-            return StoryResult(
-                story_id=req.story_id,
-                response_text=response_text,
-                story_output={
-                    "metric_definitions": metric_defs,
-                    "intent": intent,
-                    "intent_source": intent_info.get("source"),
-                    "intent_confidence": intent_info.get("confidence"),
-                    "intent_rationale": intent_info.get("rationale"),
-                    "generated_on": date.today().isoformat(),
-                },
-                state_updates_domain={"last_story_summary": "Returned KPI glossary definitions."},
-            )
-
         start_week = timeframe.get("start_week")
         end_week = timeframe.get("end_week")
         if not start_week or not end_week:
-            response_text = "No weekly data is available in the database yet."
-            return StoryResult(
-                story_id=req.story_id,
-                response_text=response_text,
-                story_output={"row_count": 0, "generated_on": date.today().isoformat()},
-                state_updates_domain={"last_story_summary": "No weekly campaign metrics available."},
-            )
+            return {
+                "available_weeks": available_weeks,
+                "timeframe": timeframe,
+                "assumptions": assumptions,
+                "rows": [],
+                "prior_rows": [],
+            }
 
         rows = read_campaign_metrics(conn, start_week=start_week, end_week=end_week, filters=filters)
 
-        # Prior period with matching calendar duration.
         prior_rows: List[Dict[str, Any]] = []
         if rows:
             start_date = datetime.strptime(start_week, "%Y-%m-%d").date()
@@ -858,62 +1290,329 @@ def run_business_marketing_story2(req: StoryRequest) -> StoryResult:
                 filters=filters,
             )
 
-        summary = aggregate_summarize(rows, group_by=group_by, prior_rows=prior_rows)
-        quality = _quality_flags(rows)
-        clean_summary = aggregate_summarize(quality["rows_for_thresholding"], group_by=group_by, prior_rows=prior_rows)
-        threshold_metrics = [m for m in metrics if m in {"click_through_rate", "customer_acquisition_cost", "return_on_ad_spend"}]
-        if not threshold_metrics:
-            threshold_metrics = ["click_through_rate", "customer_acquisition_cost", "return_on_ad_spend"]
-        underperformers = _evaluate_underperformance(conn, clean_summary["rows"], metrics_requested=threshold_metrics)
+    return {
+        "available_weeks": available_weeks,
+        "timeframe": timeframe,
+        "assumptions": assumptions,
+        "rows": rows,
+        "prior_rows": prior_rows,
+    }
 
-        payload = {
-            "glossary_only": False,
-            "intent": intent,
-            "concise": concise,
-            "timeframe": timeframe,
-            "assumptions": assumptions,
-            "filters": filters,
-            "metrics_requested": metrics,
-            "group_by": group_by,
-            "row_count": len(rows),
-            "summary": summary,
-            "underperformers": underperformers,
-            "quality": quality,
-            "unavailable_dimensions": unavailable_dimensions,
+
+def _route_after_read_metrics(state: Story2GraphState) -> str:
+    timeframe = state.get("timeframe", {})
+    if not timeframe.get("start_week") or not timeframe.get("end_week"):
+        return "format"
+    return "go"
+
+
+def _aggregate_node(state: Story2GraphState) -> Story2GraphState:
+    rows = state.get("rows", [])
+    group_by = state.get("group_by", [])
+    prior_rows = state.get("prior_rows", [])
+    return {"summary": aggregate_summarize(rows, group_by=group_by, prior_rows=prior_rows)}
+
+
+def _quality_checks_node(state: Story2GraphState) -> Story2GraphState:
+    rows = state.get("rows", [])
+    group_by = state.get("group_by", [])
+    prior_rows = state.get("prior_rows", [])
+    quality = _quality_flags(rows)
+    clean_summary = aggregate_summarize(quality["rows_for_thresholding"], group_by=group_by, prior_rows=prior_rows)
+    return {"quality": quality, "clean_summary": clean_summary}
+
+
+def _threshold_eval_node(state: Story2GraphState) -> Story2GraphState:
+    metrics = state.get("metrics_requested", [])
+    threshold_metrics = [m for m in metrics if m in {"click_through_rate", "customer_acquisition_cost", "return_on_ad_spend"}]
+    if not threshold_metrics:
+        threshold_metrics = ["click_through_rate", "customer_acquisition_cost", "return_on_ad_spend"]
+    with sqlite3.connect(DB_PATH) as conn:
+        register_sqlite_alnum_normalizer(conn)
+        _ensure_threshold_table(conn)
+        underperformers = _evaluate_underperformance(conn, state.get("clean_summary", {}).get("rows", []), metrics_requested=threshold_metrics)
+    return {"underperformers": underperformers}
+
+
+def _maybe_generate_grounded_narrative(payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    try:
+        llm = ChatOpenAI(model="gpt-4o-mini", temperature=0)
+        structured = llm.with_structured_output(GroundedNarrativeOutput)
+        facts = {
+            "intent": payload.get("intent"),
+            "timeframe": payload.get("timeframe"),
+            "row_count": payload.get("row_count"),
+            "metrics_requested": payload.get("metrics_requested"),
+            "group_by": payload.get("group_by"),
+            "overall": (payload.get("summary") or {}).get("overall", {}),
+            "group_rows_sample": ((payload.get("summary") or {}).get("rows") or [])[:3],
+            "underperformers_sample": (payload.get("underperformers") or [])[:3],
+            "quality": payload.get("quality"),
+            "assumptions": payload.get("assumptions"),
+            "unavailable_dimensions": payload.get("unavailable_dimensions"),
         }
-        response_text = _format_response(payload)
+        system = (
+            "Write a concise, grounded analysis summary for marketing KPIs.\n"
+            "Use only the provided FACTS. Do not invent fields or dimensions.\n"
+            "If evidence is limited, state limitations directly.\n"
+            "Return structured output only."
+        )
+        user = f"FACTS: {facts}"
+        out = structured.invoke([("system", system), ("user", user)])
+        conf = float(out.confidence)
+        narrative = str(out.narrative or "").strip()
+        if conf < 0.6 or not narrative:
+            return None
+        return {
+            "narrative_text": narrative,
+            "narrative_source": "llm_grounded",
+            "narrative_confidence": round(conf, 2),
+            "used_fields": list(out.used_fields or []),
+        }
+    except Exception:
+        return None
 
-    return StoryResult(
-        story_id=req.story_id,
-        response_text=response_text,
-        story_output={
+
+def _narrative_node(state: Story2GraphState) -> Story2GraphState:
+    intent = str(state.get("intent", "overview"))
+    glossary_only = bool(state.get("glossary_only", False))
+    analysis_signals = bool(state.get("analysis_signals", False))
+    if intent == "definitions" or (glossary_only and not analysis_signals):
+        return {}
+    timeframe = state.get("timeframe", {})
+    if not timeframe.get("start_week") or not timeframe.get("end_week"):
+        return {}
+    rows = state.get("rows", [])
+    payload = {
+        "intent": intent,
+        "timeframe": timeframe,
+        "assumptions": state.get("assumptions", []),
+        "filters": state.get("filters", {}),
+        "metrics_requested": state.get("metrics_requested", []),
+        "group_by": state.get("group_by", []),
+        "row_count": len(rows),
+        "summary": state.get("summary", {}),
+        "underperformers": state.get("underperformers", []),
+        "quality": state.get("quality", {}),
+        "unavailable_dimensions": state.get("unavailable_dimensions", []),
+    }
+    llm_out = _maybe_generate_grounded_narrative(payload)
+    if not llm_out:
+        return {"narrative_source": "deterministic_fallback", "narrative_confidence": 0.0}
+    return {
+        "narrative_text": llm_out["narrative_text"],
+        "narrative_source": llm_out["narrative_source"],
+        "narrative_confidence": llm_out["narrative_confidence"],
+    }
+
+
+def _response_self_check_node(state: Story2GraphState) -> Story2GraphState:
+    response_text = str(state.get("response_text", "")).strip()
+    if not response_text:
+        return {}
+    source = str((state.get("story_output") or {}).get("response_source", ""))
+    if source != "llm_grounded":
+        story_output = dict(state.get("story_output", {}))
+        story_output["self_check"] = {"status": "skipped_non_llm_response"}
+        return {"story_output": story_output}
+
+    unsupported = list(state.get("unavailable_dimensions", []))
+    lower = response_text.lower()
+    unsupported_mentions = [d for d in unsupported if re.search(rf"\b{re.escape(d)}\b", lower)]
+    if not unsupported_mentions:
+        story_output = dict(state.get("story_output", {}))
+        story_output["self_check"] = {"status": "passed", "unsupported_mentions": []}
+        return {"story_output": story_output}
+
+    payload = {
+        "glossary_only": False,
+        "intent": state.get("intent", "overview"),
+        "concise": bool(state.get("concise", False)),
+        "timeframe": state.get("timeframe", {}),
+        "assumptions": state.get("assumptions", []),
+        "filters": state.get("filters", {}),
+        "metrics_requested": state.get("metrics_requested", []),
+        "group_by": state.get("group_by", []),
+        "row_count": len(state.get("rows", [])),
+        "summary": state.get("summary", {}),
+        "underperformers": state.get("underperformers", []),
+        "quality": state.get("quality", {}),
+        "unavailable_dimensions": state.get("unavailable_dimensions", []),
+    }
+    fallback = _format_response(payload)
+    story_output = dict(state.get("story_output", {}))
+    story_output["response_source"] = "deterministic_self_check_fallback"
+    story_output["response_confidence"] = 0.0
+    story_output["self_check"] = {
+        "status": "fallback_applied",
+        "reason": "unsupported_dimension_mention",
+        "unsupported_mentions": unsupported_mentions,
+    }
+    return {"response_text": fallback, "story_output": story_output}
+
+
+def _format_response_node(state: Story2GraphState) -> Story2GraphState:
+    intent = str(state.get("intent", "overview"))
+    glossary_only = bool(state.get("glossary_only", False))
+    analysis_signals = bool(state.get("analysis_signals", False))
+    intent_info = state.get("intent_info", {})
+    metric_defs = state.get("metric_defs", {})
+    follow_up_question = str(state.get("follow_up_question", "")).strip()
+
+    if follow_up_question:
+        return {
+            "response_text": follow_up_question,
+            "follow_up_question": follow_up_question,
+            "story_output": {
+                "needs_clarification": True,
+                "requested_slot": state.get("requested_slot", "analysis_scope"),
+                "missing_slots": state.get("missing_slots", ["analysis_scope"]),
+                "intent": intent,
+                "intent_source": intent_info.get("source"),
+                "intent_confidence": intent_info.get("confidence"),
+                "intent_rationale": intent_info.get("rationale"),
+                "planner_source": state.get("planner_source", "deterministic_scope"),
+                "planner_confidence": float(state.get("planner_confidence", 0.0)),
+                "planner_rationale": state.get("planner_rationale", ""),
+                "critic_action": state.get("critic_action", ""),
+                "critic_reason": state.get("critic_reason", ""),
+                "critic_confidence": float(state.get("critic_confidence", 0.0)),
+                "replan_count": int(state.get("replan_count", 0)),
+                "generated_on": date.today().isoformat(),
+            },
+            "state_summary": "Asked user for analysis scope clarification before data retrieval.",
+        }
+
+    if intent == "definitions" or (glossary_only and not analysis_signals):
+        response_text = _format_response({"glossary_only": True, "metric_defs": metric_defs})
+        return {
+            "response_text": response_text,
+            "story_output": {
+                "metric_definitions": metric_defs,
+                "intent": intent,
+                "intent_source": intent_info.get("source"),
+                "intent_confidence": intent_info.get("confidence"),
+                "intent_rationale": intent_info.get("rationale"),
+                "generated_on": date.today().isoformat(),
+            },
+            "state_summary": "Returned KPI glossary definitions.",
+        }
+
+    timeframe = state.get("timeframe", {})
+    if not timeframe.get("start_week") or not timeframe.get("end_week"):
+        return {
+            "response_text": "No weekly data is available in the database yet.",
+            "story_output": {"row_count": 0, "generated_on": date.today().isoformat()},
+            "state_summary": "No weekly campaign metrics available.",
+        }
+
+    rows = state.get("rows", [])
+    payload = {
+        "glossary_only": False,
+        "intent": intent,
+        "concise": bool(state.get("concise", False)),
+        "timeframe": timeframe,
+        "assumptions": state.get("assumptions", []),
+        "filters": state.get("filters", {}),
+        "metrics_requested": state.get("metrics_requested", []),
+        "group_by": state.get("group_by", []),
+        "row_count": len(rows),
+        "summary": state.get("summary", {}),
+        "underperformers": state.get("underperformers", []),
+        "quality": state.get("quality", {}),
+        "unavailable_dimensions": state.get("unavailable_dimensions", []),
+    }
+    quality = state.get("quality", {})
+    response_text = str(state.get("narrative_text", "")).strip() or _format_response(payload)
+    return {
+        "response_text": response_text,
+        "story_output": {
             "intent": intent,
             "intent_source": intent_info.get("source"),
             "intent_confidence": intent_info.get("confidence"),
             "intent_rationale": intent_info.get("rationale"),
+            "planner_source": state.get("planner_source", "deterministic_scope"),
+            "planner_confidence": float(state.get("planner_confidence", 0.0)),
+            "planner_rationale": state.get("planner_rationale", ""),
+            "critic_action": state.get("critic_action", ""),
+            "critic_reason": state.get("critic_reason", ""),
+            "critic_confidence": float(state.get("critic_confidence", 0.0)),
+            "replan_count": int(state.get("replan_count", 0)),
             "timeframe": timeframe,
-            "filters": filters,
-            "group_by": group_by,
-            "metrics_requested": metrics,
+            "filters": state.get("filters", {}),
+            "group_by": state.get("group_by", []),
+            "metrics_requested": state.get("metrics_requested", []),
             "row_count": len(rows),
-            "summary": summary,
-            "underperformers": underperformers,
+            "summary": state.get("summary", {}),
+            "underperformers": state.get("underperformers", []),
             "quality": {
-                "invalid_ctr_rows": quality["invalid_ctr_rows"],
-                "null_cac_rows": quality["null_cac_rows"],
-                "null_roas_rows": quality["null_roas_rows"],
-                "excluded_from_thresholding": quality["excluded_from_thresholding"],
-                "valid_threshold_rows": quality["valid_threshold_rows"],
+                "invalid_ctr_rows": quality.get("invalid_ctr_rows", 0),
+                "null_cac_rows": quality.get("null_cac_rows", 0),
+                "null_roas_rows": quality.get("null_roas_rows", 0),
+                "excluded_from_thresholding": quality.get("excluded_from_thresholding", 0),
+                "valid_threshold_rows": quality.get("valid_threshold_rows", 0),
             },
-            "unavailable_dimensions": unavailable_dimensions,
+            "unavailable_dimensions": state.get("unavailable_dimensions", []),
             "metric_definitions": metric_defs if glossary_only else {},
+            "response_source": state.get("narrative_source", "deterministic_template"),
+            "response_confidence": float(state.get("narrative_confidence", 0.0)),
             "generated_on": date.today().isoformat(),
         },
+        "state_summary": (
+            f"Analyzed {len(rows)} weekly metric rows "
+            f"for {timeframe.get('start_week')}..{timeframe.get('end_week')}."
+        ),
+    }
+
+
+def run_business_marketing_story2(req: StoryRequest) -> StoryResult:
+    user_turn = _user_turn_number(req.messages)
+    state_out = _get_business_marketing_story2_graph().invoke(
+        {"user_query": req.user_query or "", "domain_context": req.domain_context or {}, "user_turn_number": user_turn}
+    )
+    follow_up = state_out.get("follow_up_question")
+    if follow_up:
+        return StoryResult(
+            story_id=req.story_id,
+            response_text=state_out.get("response_text") or str(follow_up),
+            follow_up_question=follow_up,
+            story_output=state_out.get("story_output", {}),
+            state_updates_domain={
+                "last_story_summary": state_out.get("state_summary", "Asked for clarification."),
+                STORY2_STATE_KEY: {
+                    "last_user_turn_number": user_turn,
+                    "last_user_query": req.user_query,
+                    "last_partial_scope": {
+                        "intent": state_out.get("intent"),
+                        "metrics_requested": state_out.get("metrics_requested", []),
+                        "group_by": state_out.get("group_by", []),
+                        "filters": state_out.get("filters", {}),
+                    },
+                    "pending_slot": state_out.get("requested_slot"),
+                    "pending_question": follow_up,
+                },
+            },
+        )
+    return StoryResult(
+        story_id=req.story_id,
+        response_text=state_out.get("response_text") or "Unable to generate a business marketing analysis response.",
+        follow_up_question=follow_up,
+        story_output=state_out.get("story_output", {}),
         state_updates_domain={
-            "last_story_summary": (
-                f"Analyzed {len(rows)} weekly metric rows "
-                f"for {timeframe.get('start_week')}..{timeframe.get('end_week')}."
-            )
+            "last_story_summary": state_out.get("state_summary", "Completed business marketing story 2 workflow."),
+            STORY2_STATE_KEY: {
+                "last_user_turn_number": user_turn,
+                "last_user_query": req.user_query,
+                "last_resolved_scope": {
+                    "intent": state_out.get("intent"),
+                    "metrics_requested": state_out.get("metrics_requested", []),
+                    "group_by": state_out.get("group_by", []),
+                    "filters": state_out.get("filters", {}),
+                },
+                "memory_applied_fields": state_out.get("memory_applied_fields", []),
+                "pending_slot": None,
+                "pending_question": None,
+            },
         },
     )
 
@@ -922,36 +1621,42 @@ def get_business_marketing_story2_mermaid() -> str:
     return _get_business_marketing_story2_graph().get_graph().draw_mermaid()
 
 
-class Story2GraphState(TypedDict, total=False):
-    user_query: str
-
-
 def _get_business_marketing_story2_graph():
     global BUSINESS_MARKETING_STORY2_GRAPH
     if BUSINESS_MARKETING_STORY2_GRAPH is not None:
         return BUSINESS_MARKETING_STORY2_GRAPH
 
     g = StateGraph(Story2GraphState)
-
-    def passthrough(state: Story2GraphState) -> Story2GraphState:
-        return state
-
-    g.add_node("classify_intent", passthrough)
-    g.add_node("extract_scope", passthrough)
-    g.add_node("read_metrics", passthrough)
-    g.add_node("aggregate", passthrough)
-    g.add_node("quality_checks", passthrough)
-    g.add_node("threshold_eval", passthrough)
-    g.add_node("format_response", passthrough)
+    g.add_node("classify_intent", _classify_intent_node)
+    g.add_node("extract_scope", _extract_scope_node)
+    g.add_node("plan_with_llm", _plan_with_llm_node)
+    g.add_node("merge_prior_scope", _merge_with_prior_scope_node)
+    g.add_node("clarify_request", _clarify_request_node)
+    g.add_node("read_metrics", _read_metrics_node)
+    g.add_node("aggregate", _aggregate_node)
+    g.add_node("quality_checks", _quality_checks_node)
+    g.add_node("critic", _critic_node)
+    g.add_node("replan_scope", _replan_scope_node)
+    g.add_node("threshold_eval", _threshold_eval_node)
+    g.add_node("narrative", _narrative_node)
+    g.add_node("format_response", _format_response_node)
+    g.add_node("self_check", _response_self_check_node)
 
     g.set_entry_point("classify_intent")
-    g.add_edge("classify_intent", "extract_scope")
-    g.add_edge("extract_scope", "read_metrics")
-    g.add_edge("read_metrics", "aggregate")
+    g.add_conditional_edges("classify_intent", _route_after_classify, {"go": "extract_scope", "format": "format_response"})
+    g.add_edge("extract_scope", "plan_with_llm")
+    g.add_edge("plan_with_llm", "merge_prior_scope")
+    g.add_conditional_edges("merge_prior_scope", _route_after_extract_scope, {"go": "read_metrics", "ask": "clarify_request"})
+    g.add_edge("clarify_request", "format_response")
+    g.add_conditional_edges("read_metrics", _route_after_read_metrics, {"go": "aggregate", "format": "format_response"})
     g.add_edge("aggregate", "quality_checks")
-    g.add_edge("quality_checks", "threshold_eval")
-    g.add_edge("threshold_eval", "format_response")
-    g.add_edge("format_response", END)
+    g.add_edge("quality_checks", "critic")
+    g.add_conditional_edges("critic", _route_after_critic, {"threshold": "threshold_eval", "replan": "replan_scope", "ask": "clarify_request"})
+    g.add_edge("replan_scope", "read_metrics")
+    g.add_edge("threshold_eval", "narrative")
+    g.add_edge("narrative", "format_response")
+    g.add_edge("format_response", "self_check")
+    g.add_edge("self_check", END)
 
     BUSINESS_MARKETING_STORY2_GRAPH = g.compile()
     return BUSINESS_MARKETING_STORY2_GRAPH
