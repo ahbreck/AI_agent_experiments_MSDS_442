@@ -36,6 +36,8 @@ ALL_METRICS = [
 SUPPORTED_TYPES = ["cycling", "tread", "rowing", "strength", "yoga"]
 TOOL_ORDER = ["summarize_time_series", "zone_distribution", "segment_by", "detect_anomalies"]
 TRUE_ENV_VALUES = {"1", "true", "TRUE"}
+DS2_STATE_KEY = "ds_story_2_state"
+MAX_REPLAN_ITERATIONS = 1
 
 
 def _env_flag_enabled(*keys: str) -> bool:
@@ -49,13 +51,24 @@ def _env_flag_enabled(*keys: str) -> bool:
 class DataScienceStoryState(TypedDict, total=False):
     user_text: str
     fallback_member: Optional[str]
+    prior_plan: Dict[str, Any]
+    prior_user_turn_number: int
+    current_user_turn_number: int
     member_id: Optional[str]
     start_date: str
     end_date: str
     types: Optional[List[str]]
     plan: Dict[str, Any]
+    plan_history: List[Dict[str, Any]]
+    carry_forward_applied: bool
+    carry_forward_fields: List[str]
     rows: List[Dict[str, Any]]
     tool_results: Dict[str, Any]
+    max_replans: int
+    replan_count: int
+    critic_action: str
+    critic_reason: str
+    critic_confidence: float
     response_text: str
     follow_up_question: Optional[str]
     row_count: int
@@ -117,6 +130,13 @@ class InterpretationOutput(BaseModel):
     response_text: str = Field(min_length=40, max_length=2400)
     confidence: float = Field(ge=0.0, le=1.0)
     rationale: str = Field(min_length=1, max_length=280)
+
+
+class CriticDecisionOutput(BaseModel):
+    action: Literal["continue", "replan_once", "ask_user"]
+    confidence: float = Field(ge=0.0, le=1.0)
+    rationale: str = Field(min_length=1, max_length=280)
+    follow_up_question: str = ""
 
 PLAN_SYSTEM = """
 You are a workout analytics planner.
@@ -270,6 +290,25 @@ def _normalize_interpretation_response_text(response_text: str) -> str:
             lines.append("")
 
     return "\n".join(lines).strip() or response_text
+
+
+def _user_turn_number(messages: List[Dict[str, Any]]) -> int:
+    turns = 0
+    for m in messages or []:
+        if str(m.get("role", "")).strip().lower() == "user":
+            turns += 1
+    return turns + 1
+
+
+def _is_follow_up_like(user_text: str, user_turn_number: int, prior_turn_number: int) -> bool:
+    text = (user_text or "").strip().lower()
+    if not text:
+        return False
+    tokens = [t for t in re.split(r"\s+", text) if t]
+    deictic = bool(re.search(r"\b(same|that|those|it|also|instead|keep|use previous|as above)\b", text))
+    short_turn = len(tokens) <= 14
+    close_turn = prior_turn_number > 0 and (user_turn_number - prior_turn_number) <= 2
+    return (short_turn and close_turn) or deictic
 
 
 def _phrase_in_text(text: str, phrase: str) -> bool:
@@ -716,7 +755,7 @@ def _maybe_llm_plan(
         plan_model = AnalysisPlan.model_validate(candidate)
     except ValidationError as exc:
         return None, "plan_schema_validation_failed", {
-            "raw_response_excerpt": text[:400],
+            "raw_response_excerpt": json.dumps(model_debug, ensure_ascii=True)[:400],
             "parsed_excerpt": json.dumps(normalized_parsed, ensure_ascii=True)[:400],
             "validation_errors": exc.errors()[:3],
         }
@@ -845,6 +884,46 @@ def _plan_from_query(user_text: str, member_id: str, start_date: str, end_date: 
     out["intent_scores"] = scores
     out["metrics_selected"] = metrics
     return out
+
+
+def _merge_with_prior_plan(
+    user_text: str,
+    explicit_member: Optional[str],
+    explicit_dates: Optional[Tuple[str, str]],
+    inferred_types: Optional[List[str]],
+    current_plan: Dict[str, Any],
+    prior_plan: Dict[str, Any],
+    is_follow_up_turn: bool,
+) -> Tuple[Dict[str, Any], List[str]]:
+    if not is_follow_up_turn or not isinstance(prior_plan, dict) or not prior_plan:
+        return current_plan, []
+
+    merged = dict(current_plan)
+    applied: List[str] = []
+
+    if not explicit_member and prior_plan.get("member_id"):
+        merged["member_id"] = str(prior_plan.get("member_id"))
+        applied.append("member_id")
+
+    if explicit_dates is None:
+        p_start = str(prior_plan.get("start_date") or "")
+        p_end = str(prior_plan.get("end_date") or "")
+        if p_start and p_end:
+            merged["start_date"] = p_start
+            merged["end_date"] = p_end
+            applied.extend(["start_date", "end_date"])
+
+    if not inferred_types and isinstance(prior_plan.get("types"), list) and prior_plan.get("types"):
+        merged["types"] = [t for t in prior_plan.get("types", []) if t in SUPPORTED_TYPES] or None
+        applied.append("types")
+
+    intent_scores = merged.get("intent_scores", {})
+    low_intent_signal = isinstance(intent_scores, dict) and sum(int(v) for v in intent_scores.values() if isinstance(v, int)) == 0
+    if low_intent_signal and isinstance(prior_plan.get("steps"), list) and prior_plan.get("steps"):
+        merged["steps"] = prior_plan.get("steps", [])[:5]
+        applied.append("steps")
+
+    return merged, applied
 
 
 def _execute_plan(plan: Dict[str, Any], rows: List[Dict[str, Any]]) -> Dict[str, Any]:
@@ -1080,9 +1159,180 @@ def _maybe_llm_interpret_results(user_text: str, plan: Dict[str, Any], tool_resu
         return None
 
 
+def _count_failed_tool_steps(tool_results: Dict[str, Any]) -> int:
+    failures = 0
+    for k, v in (tool_results or {}).items():
+        if not k.startswith("step_") or not isinstance(v, dict):
+            continue
+        if v.get("ok") is False:
+            failures += 1
+        elif isinstance(v.get("error"), str) and v.get("error"):
+            failures += 1
+    return failures
+
+
+def _maybe_llm_critic_decision(state: DataScienceStoryState) -> Optional[Dict[str, Any]]:
+    if not _env_flag_enabled("PROTOTYPE_DS2_USE_LLM_CRITIC"):
+        return None
+    if not os.getenv("OPENAI_API_KEY"):
+        return None
+    try:
+        from langchain_openai import ChatOpenAI
+    except Exception:
+        return None
+
+    try:
+        llm = ChatOpenAI(model=os.getenv("PROTOTYPE_DS2_CRITIC_MODEL", "gpt-4o-mini"), temperature=0)
+        structured = llm.with_structured_output(CriticDecisionOutput)
+        compact_results = _summarize_tool_results_for_prompt(state.get("tool_results", {}))
+        critic_input = {
+            "user_text": state.get("user_text", ""),
+            "row_count": int(state.get("row_count", 0)),
+            "plan": state.get("plan", {}),
+            "compact_results": compact_results,
+            "failed_steps": _count_failed_tool_steps(state.get("tool_results", {})),
+            "replan_count": int(state.get("replan_count", 0)),
+            "max_replans": int(state.get("max_replans", MAX_REPLAN_ITERATIONS)),
+        }
+        system = (
+            "You are a critic for a workout analytics plan.\n"
+            "Choose action from: continue, replan_once, ask_user.\n"
+            "Use replan_once only when one bounded scope change likely improves usefulness.\n"
+            "Never choose replan_once when replan_count >= max_replans.\n"
+            "Use ask_user only for unresolved ambiguity or repeated empty results."
+        )
+        out = structured.invoke([("system", system), ("user", json.dumps(critic_input, ensure_ascii=True))])
+        return out.model_dump() if out else None
+    except Exception:
+        return None
+
+
+def _critic_node(state: DataScienceStoryState) -> DataScienceStoryState:
+    if state.get("response_text") and state.get("follow_up_question"):
+        return {"critic_action": "ask_user", "critic_reason": "Waiting for member_id clarification.", "critic_confidence": 1.0}
+
+    row_count = int(state.get("row_count", 0))
+    plan = state.get("plan", {})
+    replan_count = int(state.get("replan_count", 0))
+    max_replans = int(state.get("max_replans", MAX_REPLAN_ITERATIONS))
+    tool_results = state.get("tool_results", {})
+
+    action = "continue"
+    reason = "Execution produced enough signal for interpretation."
+    confidence = 0.76
+    question = ""
+
+    failed_steps = _count_failed_tool_steps(tool_results)
+    trend_period_count = 0
+    trend_keys = [k for k in tool_results.keys() if "summarize_time_series" in k]
+    if trend_keys:
+        trend_period_count = int(tool_results.get(trend_keys[0], {}).get("period_count", 0) or 0)
+
+    if row_count == 0:
+        if replan_count < max_replans:
+            action = "replan_once"
+            reason = "No rows matched this scope; retry once with broader scope."
+            confidence = 0.93
+        else:
+            action = "ask_user"
+            reason = "No rows after one broadened retry."
+            confidence = 0.94
+            question = "I still found no workouts in this scope. Do you want to widen to the latest 12 weeks and all workout types?"
+    elif replan_count < max_replans and row_count < 6:
+        action = "replan_once"
+        reason = "Sample size is small; one broader retry may improve signal."
+        confidence = 0.81
+    elif replan_count < max_replans and failed_steps > 0:
+        action = "replan_once"
+        reason = "At least one analysis step failed; retrying with a safer plan."
+        confidence = 0.8
+    elif replan_count < max_replans and trend_period_count > 0 and trend_period_count < 3 and row_count < 12:
+        action = "replan_once"
+        reason = "Trend windows are too sparse for stable directionality."
+        confidence = 0.74
+
+    llm_out = _maybe_llm_critic_decision(state)
+    if llm_out:
+        llm_conf = float(llm_out.get("confidence", 0.0))
+        llm_action = str(llm_out.get("action", "")).strip()
+        if llm_conf >= 0.65 and llm_action in {"continue", "replan_once", "ask_user"}:
+            if llm_action == "replan_once" and replan_count >= max_replans:
+                llm_action = "continue"
+            action = llm_action
+            reason = str(llm_out.get("rationale") or reason)
+            confidence = llm_conf
+            if action == "ask_user":
+                question = str(llm_out.get("follow_up_question") or "").strip()
+
+    out: Dict[str, Any] = {
+        "critic_action": action,
+        "critic_reason": reason,
+        "critic_confidence": round(confidence, 3),
+    }
+    if action == "ask_user":
+        ask = question or "What scope should I use next: wider date range, different workout types, or a different member_id?"
+        out["response_text"] = ask
+        out["follow_up_question"] = ask
+    return out
+
+
+def _replan_once_node(state: DataScienceStoryState) -> DataScienceStoryState:
+    plan = dict(state.get("plan", {}))
+    if not plan:
+        return {}
+
+    replan_count = int(state.get("replan_count", 0)) + 1
+    max_replans = int(state.get("max_replans", MAX_REPLAN_ITERATIONS))
+    adjustments: List[str] = []
+
+    if plan.get("types"):
+        plan["types"] = None
+        adjustments.append("types")
+
+    try:
+        start = datetime.fromisoformat(str(plan.get("start_date"))).date()
+        end = datetime.fromisoformat(str(plan.get("end_date"))).date()
+        if (end - start).days < 56:
+            widened_start = (end - timedelta(days=83)).isoformat()
+            plan["start_date"] = widened_start
+            adjustments.append("start_date")
+    except Exception:
+        pass
+
+    steps = list(plan.get("steps", []))
+    if not any(str(s.get("tool")) == "summarize_time_series" for s in steps if isinstance(s, dict)):
+        steps.insert(0, {"tool": "summarize_time_series", "args": {"metrics": SAFE_DEFAULT_METRICS, "freq": "W"}})
+        plan["steps"] = steps[:5]
+        adjustments.append("steps")
+
+    plan_history = list(state.get("plan_history", []))
+    plan_history.append(
+        {
+            "iteration": replan_count,
+            "plan": dict(plan),
+            "adjustments": adjustments,
+            "reason": str(state.get("critic_reason", "")),
+        }
+    )
+
+    return {
+        "plan": plan,
+        "start_date": str(plan.get("start_date") or state.get("start_date")),
+        "end_date": str(plan.get("end_date") or state.get("end_date")),
+        "types": plan.get("types"),
+        "plan_history": plan_history,
+        "replan_count": min(replan_count, max_replans),
+    }
+
+
 def _plan_node(state: DataScienceStoryState) -> DataScienceStoryState:
     user_text = state.get("user_text", "")
     fallback_member = state.get("fallback_member")
+    explicit_member = extract_explicit_member_id(user_text)
+    explicit_dates = _extract_date_range(user_text)
+    prior_plan = state.get("prior_plan", {}) if isinstance(state.get("prior_plan"), dict) else {}
+    prior_turn_number = int(state.get("prior_user_turn_number", 0) or 0)
+    current_turn_number = int(state.get("current_user_turn_number", 0) or 0)
     member_id, start_date, end_date, types = _parse_request(user_text, fallback_member=fallback_member)
     if not member_id:
         ask = "What is your member_id (e.g., MB001)? If dates are missing I will analyze the last 8 weeks."
@@ -1095,12 +1345,27 @@ def _plan_node(state: DataScienceStoryState) -> DataScienceStoryState:
         end_date=end_date,
         types=types,
     )
+    follow_up_turn = _is_follow_up_like(user_text, user_turn_number=current_turn_number, prior_turn_number=prior_turn_number)
+    plan, carry_fields = _merge_with_prior_plan(
+        user_text=user_text,
+        explicit_member=explicit_member,
+        explicit_dates=explicit_dates,
+        inferred_types=types,
+        current_plan=plan,
+        prior_plan=prior_plan,
+        is_follow_up_turn=follow_up_turn,
+    )
     return {
-        "member_id": member_id,
-        "start_date": start_date,
-        "end_date": end_date,
-        "types": types,
+        "member_id": str(plan.get("member_id") or member_id),
+        "start_date": str(plan.get("start_date") or start_date),
+        "end_date": str(plan.get("end_date") or end_date),
+        "types": plan.get("types"),
         "plan": plan,
+        "plan_history": [{"iteration": 0, "plan": dict(plan), "adjustments": carry_fields or []}],
+        "carry_forward_applied": bool(carry_fields),
+        "carry_forward_fields": carry_fields,
+        "replan_count": int(state.get("replan_count", 0)),
+        "max_replans": int(state.get("max_replans", MAX_REPLAN_ITERATIONS)),
     }
 
 
@@ -1117,8 +1382,7 @@ def _run_tools_node(state: DataScienceStoryState) -> DataScienceStoryState:
     rows_sorted = sorted(rows, key=lambda r: datetime.fromisoformat(str(r["date"])))
 
     if not rows_sorted:
-        msg = f"I did not find workouts for {member_id} between {start_date} and {end_date}."
-        return {"rows": [], "row_count": 0, "tool_results": {}, "response_text": msg, "follow_up_question": None}
+        return {"rows": [], "row_count": 0, "tool_results": {}}
 
     tool_results = _execute_plan(plan=plan, rows=rows_sorted)
     return {"rows": rows_sorted, "row_count": len(rows_sorted), "tool_results": tool_results}
@@ -1160,17 +1424,32 @@ def _route_after_plan(state: DataScienceStoryState) -> str:
 
 
 def _route_after_tools(state: DataScienceStoryState) -> str:
-    return "done" if state.get("response_text") else "interpret"
+    return "done" if state.get("response_text") else "critic"
+
+
+def _route_after_critic(state: DataScienceStoryState) -> str:
+    action = str(state.get("critic_action", "continue"))
+    replan_count = int(state.get("replan_count", 0))
+    max_replans = int(state.get("max_replans", MAX_REPLAN_ITERATIONS))
+    if action == "ask_user":
+        return "ask"
+    if action == "replan_once" and replan_count < max_replans:
+        return "replan"
+    return "interpret"
 
 
 def _build_story_graph():
     g = StateGraph(DataScienceStoryState)
     g.add_node("plan", _plan_node)
     g.add_node("run_tools", _run_tools_node)
+    g.add_node("critic", _critic_node)
+    g.add_node("replan_once", _replan_once_node)
     g.add_node("interpret", _interpret_node)
     g.set_entry_point("plan")
     g.add_conditional_edges("plan", _route_after_plan, {"ask": END, "go": "run_tools"})
-    g.add_conditional_edges("run_tools", _route_after_tools, {"done": END, "interpret": "interpret"})
+    g.add_conditional_edges("run_tools", _route_after_tools, {"done": END, "critic": "critic"})
+    g.add_conditional_edges("critic", _route_after_critic, {"ask": END, "replan": "replan_once", "interpret": "interpret"})
+    g.add_edge("replan_once", "run_tools")
     g.add_edge("interpret", END)
     return g.compile()
 
@@ -1190,10 +1469,20 @@ def get_data_science_story2_mermaid() -> str:
 
 
 def run_data_science_story2(req: StoryRequest) -> StoryResult:
+    ds_state = req.domain_context.get(DS2_STATE_KEY, {}) if isinstance(req.domain_context, dict) else {}
+    prior_plan = ds_state.get("last_plan") if isinstance(ds_state, dict) and isinstance(ds_state.get("last_plan"), dict) else {}
+    prior_user_turn = int(ds_state.get("last_user_turn_number", 0) or 0) if isinstance(ds_state, dict) else 0
+    current_user_turn = _user_turn_number(req.messages if isinstance(req.messages, list) else [])
+
     state_out = _get_data_science_graph().invoke(
         {
             "user_text": req.user_query,
             "fallback_member": req.member.member_id,
+            "prior_plan": prior_plan,
+            "prior_user_turn_number": prior_user_turn,
+            "current_user_turn_number": current_user_turn,
+            "max_replans": MAX_REPLAN_ITERATIONS,
+            "replan_count": 0,
         }
     )
 
@@ -1218,10 +1507,19 @@ def run_data_science_story2(req: StoryRequest) -> StoryResult:
     interpretation_source = str(state_out.get("interpretation_source") or "deterministic_template")
     interpretation_confidence = float(state_out.get("interpretation_confidence", 0.0))
     interpretation_rationale = str(state_out.get("interpretation_rationale") or "")
+    critic_action = str(state_out.get("critic_action") or "")
+    critic_reason = str(state_out.get("critic_reason") or "")
+    critic_confidence = float(state_out.get("critic_confidence", 0.0))
+    carry_forward_applied = bool(state_out.get("carry_forward_applied", False))
+    carry_forward_fields = state_out.get("carry_forward_fields", [])
+    plan_history = state_out.get("plan_history", [])
+    replan_count = int(state_out.get("replan_count", 0))
+    follow_up_question = state_out.get("follow_up_question")
 
     return StoryResult(
         story_id=req.story_id,
         response_text=response_text,
+        follow_up_question=follow_up_question if isinstance(follow_up_question, str) and follow_up_question.strip() else None,
         story_output={
             "member_id": member_id,
             "start_date": start_date,
@@ -1233,8 +1531,29 @@ def run_data_science_story2(req: StoryRequest) -> StoryResult:
             "interpretation_source": interpretation_source,
             "interpretation_confidence": round(interpretation_confidence, 3),
             "interpretation_rationale": interpretation_rationale,
+            "critic_action": critic_action,
+            "critic_reason": critic_reason,
+            "critic_confidence": round(critic_confidence, 3),
+            "carry_forward_applied": carry_forward_applied,
+            "carry_forward_fields": carry_forward_fields if isinstance(carry_forward_fields, list) else [],
+            "replan_count": replan_count,
+            "plan_history": plan_history if isinstance(plan_history, list) else [],
+            "needs_clarification": bool(follow_up_question) and bool(member_id),
             "generated_on": date.today().isoformat(),
         },
         state_updates_global={"member": {"member_id": member_id}} if member_id else {},
-        state_updates_domain={"last_story_summary": f"Planned {len(plan.get('steps', []))} step(s); analyzed {row_count} workouts."},
+        state_updates_domain={
+            "last_story_summary": f"Planned {len(plan.get('steps', []))} step(s); analyzed {row_count} workouts.",
+            DS2_STATE_KEY: {
+                "last_plan": plan if isinstance(plan, dict) else {},
+                "last_plan_history": plan_history if isinstance(plan_history, list) else [],
+                "last_replan_count": replan_count,
+                "last_critic_action": critic_action,
+                "last_critic_reason": critic_reason,
+                "last_critic_confidence": round(critic_confidence, 3),
+                "last_carry_forward_fields": carry_forward_fields if isinstance(carry_forward_fields, list) else [],
+                "last_user_turn_number": current_user_turn,
+                "last_user_query": req.user_query,
+            },
+        },
     )
