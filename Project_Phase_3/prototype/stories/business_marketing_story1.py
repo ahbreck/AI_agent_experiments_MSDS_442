@@ -3,7 +3,7 @@ from __future__ import annotations
 import re
 import sqlite3
 from collections import defaultdict
-from datetime import date
+from datetime import date, timedelta
 from pathlib import Path
 from typing import Any, Dict, List, Optional, TypedDict
 
@@ -65,6 +65,12 @@ class FeedbackGraphState(TypedDict, total=False):
     validation_warnings: List[str]
     route_mode: str
     data_quality: Dict[str, Any]
+    rescope_attempt: int
+    max_rescope_attempts: int
+    rescope_actions: List[Dict[str, str]]
+    rescope_exhausted: bool
+    recommend_retry_count: int
+    recommend_retry_requested: bool
     response_text: str
     follow_up_question: Optional[str]
 
@@ -231,7 +237,15 @@ def _deterministic_adjustment_for_theme(theme: Dict[str, Any]) -> Dict[str, Any]
 
 def _parse_node(state: FeedbackGraphState) -> FeedbackGraphState:
     filters = _parse_filters(state.get("user_text", ""))
-    return {"filters": FeedbackFilters(**filters).model_dump()}
+    return {
+        "filters": FeedbackFilters(**filters).model_dump(),
+        "rescope_attempt": 0,
+        "max_rescope_attempts": 3,
+        "rescope_actions": [],
+        "rescope_exhausted": False,
+        "recommend_retry_count": 0,
+        "recommend_retry_requested": False,
+    }
 
 
 def _retrieve_node(state: FeedbackGraphState) -> FeedbackGraphState:
@@ -253,18 +267,100 @@ def _focus_node(state: FeedbackGraphState) -> FeedbackGraphState:
 def _route_node(state: FeedbackGraphState) -> FeedbackGraphState:
     agg = state.get("aggregation", {})
     total_n = int(agg.get("total_n", 0))
+    attempts = int(state.get("rescope_attempt", 0))
+    max_attempts = int(state.get("max_rescope_attempts", 3))
     if total_n == 0:
         mode = "no_data"
     elif total_n < LOW_DATA_THRESHOLD:
         mode = "low_data"
     else:
         mode = "normal"
+    exhausted = False
+    if mode in {"no_data", "low_data"}:
+        exhausted = attempts >= max_attempts or _next_rescope_action(state) is None
     return {
         "route_mode": mode,
         "data_quality": {
             "total_n": total_n,
             "low_data_threshold": LOW_DATA_THRESHOLD,
         },
+        "rescope_exhausted": exhausted,
+    }
+
+
+def _timeframe_weeks(filters: Dict[str, Any]) -> Optional[int]:
+    start = filters.get("start_date")
+    end = filters.get("end_date")
+    if start and end:
+        try:
+            d_start = date.fromisoformat(str(start))
+            d_end = date.fromisoformat(str(end))
+            days = max((d_end - d_start).days, 0)
+            return max(1, (days + 6) // 7)
+        except ValueError:
+            pass
+
+    label = str(filters.get("timeframe_label") or "")
+    m = re.search(r"(\d+)\s*_?\s*weeks?", label.lower())
+    if m:
+        try:
+            return int(m.group(1))
+        except ValueError:
+            return None
+    return None
+
+
+def _set_timeframe(filters: Dict[str, Any], weeks: int) -> None:
+    today = date.today()
+    filters["end_date"] = today.isoformat()
+    filters["start_date"] = (today - timedelta(weeks=weeks)).isoformat()
+    filters["timeframe_label"] = f"last_{weeks}_weeks"
+
+
+def _next_rescope_action(state: FeedbackGraphState) -> Optional[Dict[str, str]]:
+    filters = dict(state.get("filters", {}))
+    done = {str(a.get("action")) for a in state.get("rescope_actions", [])}
+    weeks = _timeframe_weeks(filters)
+
+    if "widen_to_8_weeks" not in done and (weeks is None or weeks < 8):
+        return {"action": "widen_to_8_weeks", "reason": f"timeframe_weeks={weeks or 'unknown'} < 8"}
+    if "widen_to_12_weeks" not in done and (weeks is None or weeks < 12):
+        return {"action": "widen_to_12_weeks", "reason": f"timeframe_weeks={weeks or 'unknown'} < 12"}
+    if "drop_campaign_ids" not in done and filters.get("campaign_ids"):
+        return {"action": "drop_campaign_ids", "reason": "campaign_ids filter present"}
+    if "drop_feedback_channels" not in done and filters.get("feedback_channels"):
+        return {"action": "drop_feedback_channels", "reason": "feedback_channels filter present"}
+    return None
+
+
+def _rescope_node(state: FeedbackGraphState) -> FeedbackGraphState:
+    filters = dict(state.get("filters", {}))
+    actions = list(state.get("rescope_actions", []))
+    attempts = int(state.get("rescope_attempt", 0))
+    max_attempts = int(state.get("max_rescope_attempts", 3))
+    if attempts >= max_attempts:
+        return {"rescope_exhausted": True}
+
+    step = _next_rescope_action(state)
+    if not step:
+        return {"rescope_exhausted": True}
+
+    action = step["action"]
+    if action == "widen_to_8_weeks":
+        _set_timeframe(filters, 8)
+    elif action == "widen_to_12_weeks":
+        _set_timeframe(filters, 12)
+    elif action == "drop_campaign_ids":
+        filters["campaign_ids"] = None
+    elif action == "drop_feedback_channels":
+        filters["feedback_channels"] = None
+
+    actions.append(step)
+    return {
+        "filters": FeedbackFilters(**filters).model_dump(),
+        "rescope_attempt": attempts + 1,
+        "rescope_actions": actions,
+        "rescope_exhausted": False,
     }
 
 
@@ -283,14 +379,19 @@ def _recommend_node(state: FeedbackGraphState, llm: ChatOpenAI) -> FeedbackGraph
         "Each adjustment must include 2-3 receipts citing actual numbers.\n"
         "Output must match schema: adjustments[{title, change, why_grounded, receipts}]."
     )
+    if int(state.get("recommend_retry_count", 0)) > 0:
+        system += (
+            "\nStrict grounding mode: every adjustment must name exactly one known theme and include at least "
+            "two exact numeric receipts that match that theme's stats."
+        )
     user = f"Theme stats (sorted by salience):\n{themes}\n\nFocus themes:\n{focus_rows}\n"
 
     try:
         structured = llm.with_structured_output(AdjustmentsLLMOutput)
         out = structured.invoke([("system", system), ("user", user)])
-        return {"adjustments": [a.model_dump() for a in out.adjustments]}
+        return {"adjustments": [a.model_dump() for a in out.adjustments], "recommend_retry_requested": False}
     except Exception:
-        return {"adjustments": _deterministic_adjustments(themes)}
+        return {"adjustments": _deterministic_adjustments(themes), "recommend_retry_requested": False}
 
 
 def _validate_recommendations(state: FeedbackGraphState) -> Dict[str, Any]:
@@ -389,8 +490,18 @@ def _validate_node(state: FeedbackGraphState) -> FeedbackGraphState:
     warnings: List[str] = list(checked.get("warnings", []))
     invalid_indices: List[int] = list(checked.get("invalid_indices", []))
     adjustments = list(state.get("adjustments", []))
+    retry_count = int(state.get("recommend_retry_count", 0))
+
+    if invalid_indices and retry_count < 1:
+        warnings.append("validation: retrying recommendation generation in strict grounding mode")
+        return {
+            "validation_warnings": warnings,
+            "recommend_retry_count": retry_count + 1,
+            "recommend_retry_requested": True,
+        }
+
     if not invalid_indices or not adjustments:
-        return {"validation_warnings": warnings}
+        return {"validation_warnings": warnings, "recommend_retry_requested": False}
 
     themes = state.get("aggregation", {}).get("themes", [])
     focus = [str(x) for x in state.get("focus_themes", [])]
@@ -413,7 +524,7 @@ def _validate_node(state: FeedbackGraphState) -> FeedbackGraphState:
             f"adjustment_{bad_idx + 1}: replaced with deterministic grounded adjustment for theme={theme.get('theme')}"
         )
 
-    return {"adjustments": adjustments, "validation_warnings": warnings}
+    return {"adjustments": adjustments, "validation_warnings": warnings, "recommend_retry_requested": False}
 
 
 def _format_node(state: FeedbackGraphState) -> FeedbackGraphState:
@@ -423,18 +534,23 @@ def _format_node(state: FeedbackGraphState) -> FeedbackGraphState:
     themes = agg.get("themes", [])
     adjustments = state.get("adjustments", [])
     route_mode = state.get("route_mode") or "normal"
+    rescope_actions = state.get("rescope_actions", [])
+    rescope_attempt = int(state.get("rescope_attempt", 0))
+    max_rescope_attempts = int(state.get("max_rescope_attempts", 3))
 
     if route_mode == "no_data" or not themes:
-        text = (
-            "No feedback matched those filters. "
-            "Try widening the date range, removing channel filters, or omitting campaign_ids."
-        )
+        text = "No feedback matched those filters."
+        if rescope_actions:
+            action_text = "; ".join(f"{a.get('action')} ({a.get('reason')})" for a in rescope_actions)
+            text += f" Auto-rescope attempts: {rescope_attempt}/{max_rescope_attempts}. Tried: {action_text}."
+        text += " Try widening the date range, removing channel filters, or omitting campaign_ids."
         return {"response_text": text, "follow_up_question": None}
     if route_mode == "low_data":
         lines = [
             "Brand Manager Feedback Themes Summary (Limited Sample)",
             f"Date range: {filters.start_date}..{filters.end_date} ({filters.timeframe_label})",
             f"Rows analyzed: {agg.get('total_n', len(rows))} (low confidence; target >= {LOW_DATA_THRESHOLD})",
+            f"Auto-rescope attempts used: {rescope_attempt}/{max_rescope_attempts}",
             "Top themes (provisional):",
         ]
         for t in themes[:2]:
@@ -446,6 +562,11 @@ def _format_node(state: FeedbackGraphState) -> FeedbackGraphState:
             "or include all channels/campaigns to improve confidence?"
         )
         lines.append("")
+        if rescope_actions:
+            lines.append("Rescope actions tried:")
+            for a in rescope_actions:
+                lines.append(f"- {a.get('action')}: {a.get('reason')}")
+            lines.append("")
         lines.append("I can provide stronger recommendations after expanding scope.")
         return {"response_text": "\n".join(lines), "follow_up_question": follow_up}
 
@@ -478,22 +599,34 @@ def _build_story_graph():
     g.add_node("retrieve", _retrieve_node)
     g.add_node("aggregate", _aggregate_node)
     g.add_node("route", _route_node)
+    g.add_node("rescope", _rescope_node)
     g.add_node("focus", _focus_node)
     g.add_node("recommend", recommend_node)
     g.add_node("validate", _validate_node)
     g.add_node("format", _format_node)
 
     def route_after_route(state: FeedbackGraphState) -> str:
-        return state.get("route_mode") or "normal"
+        mode = state.get("route_mode") or "normal"
+        if mode in {"no_data", "low_data"}:
+            attempts = int(state.get("rescope_attempt", 0))
+            max_attempts = int(state.get("max_rescope_attempts", 3))
+            if attempts < max_attempts and _next_rescope_action(state):
+                return "retry"
+            return "format"
+        return "normal"
+
+    def route_after_validate(state: FeedbackGraphState) -> str:
+        return "retry_recommend" if state.get("recommend_retry_requested") else "format"
 
     g.set_entry_point("parse")
     g.add_edge("parse", "retrieve")
     g.add_edge("retrieve", "aggregate")
     g.add_edge("aggregate", "route")
-    g.add_conditional_edges("route", route_after_route, {"no_data": "format", "low_data": "format", "normal": "focus"})
+    g.add_conditional_edges("route", route_after_route, {"retry": "rescope", "format": "format", "normal": "focus"})
+    g.add_edge("rescope", "retrieve")
     g.add_edge("focus", "recommend")
     g.add_edge("recommend", "validate")
-    g.add_edge("validate", "format")
+    g.add_conditional_edges("validate", route_after_validate, {"retry_recommend": "recommend", "format": "format"})
     g.add_edge("format", END)
     return g.compile()
 
@@ -522,6 +655,11 @@ def run_business_marketing_story1(req: StoryRequest) -> StoryResult:
     validation_warnings = state_out.get("validation_warnings", [])
     route_mode = state_out.get("route_mode", "normal")
     data_quality = state_out.get("data_quality", {})
+    rescope_attempt = int(state_out.get("rescope_attempt", 0))
+    max_rescope_attempts = int(state_out.get("max_rescope_attempts", 3))
+    rescope_actions = state_out.get("rescope_actions", [])
+    rescope_exhausted = bool(state_out.get("rescope_exhausted", False))
+    recommend_retry_count = int(state_out.get("recommend_retry_count", 0))
     text = state_out.get("response_text", "I can summarize campaign feedback.")
 
     return StoryResult(
@@ -537,6 +675,11 @@ def run_business_marketing_story1(req: StoryRequest) -> StoryResult:
             "validation_warnings": validation_warnings,
             "route_mode": route_mode,
             "data_quality": data_quality,
+            "rescope_attempt": rescope_attempt,
+            "max_rescope_attempts": max_rescope_attempts,
+            "rescope_actions": rescope_actions,
+            "rescope_exhausted": rescope_exhausted,
+            "recommend_retry_count": recommend_retry_count,
             "generated_on": date.today().isoformat(),
         },
         state_updates_domain={"last_story_summary": f"Analyzed {agg.get('total_n', 0)} feedback rows."},
