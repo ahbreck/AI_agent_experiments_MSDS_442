@@ -35,6 +35,15 @@ ALL_METRICS = [
 ]
 SUPPORTED_TYPES = ["cycling", "tread", "rowing", "strength", "yoga"]
 TOOL_ORDER = ["summarize_time_series", "zone_distribution", "segment_by", "detect_anomalies"]
+TRUE_ENV_VALUES = {"1", "true", "TRUE"}
+
+
+def _env_flag_enabled(*keys: str) -> bool:
+    for key in keys:
+        value = os.getenv(key)
+        if value is not None:
+            return value.strip() in TRUE_ENV_VALUES
+    return False
 
 
 class DataScienceStoryState(TypedDict, total=False):
@@ -50,6 +59,9 @@ class DataScienceStoryState(TypedDict, total=False):
     response_text: str
     follow_up_question: Optional[str]
     row_count: int
+    interpretation_source: str
+    interpretation_confidence: float
+    interpretation_rationale: str
 
 
 class SummarizeArgs(BaseModel):
@@ -99,6 +111,12 @@ class AnalysisPlan(BaseModel):
     end_date: str
     types: Optional[List[str]] = None
     steps: List[PlanStep] = Field(min_length=1, max_length=5)
+
+
+class InterpretationOutput(BaseModel):
+    response_text: str = Field(min_length=40, max_length=2400)
+    confidence: float = Field(ge=0.0, le=1.0)
+    rationale: str = Field(min_length=1, max_length=280)
 
 PLAN_SYSTEM = """
 You are a workout analytics planner.
@@ -186,6 +204,72 @@ def _safe_json_extract(text: str) -> Optional[Dict[str, Any]]:
         return parsed if isinstance(parsed, dict) else None
     except json.JSONDecodeError:
         return None
+
+
+def _normalize_llm_plan_payload(parsed: Dict[str, Any]) -> Dict[str, Any]:
+    normalized = dict(parsed)
+    raw_types = normalized.get("types")
+    if isinstance(raw_types, str):
+        normalized["types"] = [raw_types]
+    elif isinstance(raw_types, list):
+        normalized["types"] = [str(t) for t in raw_types if t is not None]
+    elif raw_types is not None:
+        normalized["types"] = None
+
+    raw_steps = normalized.get("steps")
+    if not isinstance(raw_steps, list):
+        normalized["steps"] = []
+        return normalized
+
+    steps_out: List[Dict[str, Any]] = []
+    for step in raw_steps[:5]:
+        if not isinstance(step, dict):
+            continue
+        tool = step.get("tool")
+        args = step.get("args", {})
+        if not isinstance(args, dict):
+            args = {}
+
+        if tool in {"summarize_time_series", "segment_by"}:
+            metrics = args.get("metrics")
+            if isinstance(metrics, str):
+                args["metrics"] = [metrics]
+        if tool == "segment_by":
+            by = args.get("by")
+            if isinstance(by, str):
+                args["by"] = [by]
+            elif not isinstance(by, list):
+                args["by"] = []
+
+        steps_out.append({"tool": tool, "args": args})
+
+    normalized["steps"] = steps_out
+    return normalized
+
+
+def _normalize_interpretation_response_text(response_text: str) -> str:
+    parsed = _safe_json_extract(response_text)
+    if not parsed:
+        return response_text
+
+    field_map = [
+        ("key_takeaways", "Key Takeaways"),
+        ("likely_drivers", "Likely Drivers"),
+        ("next_experiment", "Next Experiment"),
+        ("limitations", "Limitations"),
+    ]
+    if not any(k in parsed for k, _ in field_map):
+        return response_text
+
+    lines: List[str] = []
+    for key, title in field_map:
+        val = parsed.get(key)
+        if isinstance(val, str) and val.strip():
+            lines.append(f"{title}:")
+            lines.append(val.strip())
+            lines.append("")
+
+    return "\n".join(lines).strip() or response_text
 
 
 def _phrase_in_text(text: str, phrase: str) -> bool:
@@ -572,60 +656,90 @@ def _coerce_plan_from_model(plan: AnalysisPlan, member_id: str, start_date: str,
     }
 
 
-def _maybe_llm_plan(user_text: str, member_id: str, start_date: str, end_date: str, types: Optional[List[str]], metrics: List[str]) -> Optional[Dict[str, Any]]:
-    if os.getenv("PROTOTYPE_DS_USE_LLM_PLAN", "0").strip() not in {"1", "true", "TRUE"}:
-        return None
+def _maybe_llm_plan(
+    user_text: str, member_id: str, start_date: str, end_date: str, types: Optional[List[str]], metrics: List[str]
+) -> Tuple[Optional[Dict[str, Any]], str, Dict[str, Any]]:
+    if not _env_flag_enabled("PROTOTYPE_DS2_USE_LLM_PLAN"):
+        return None, "disabled_by_env", {}
     try:
         from langchain_openai import ChatOpenAI
     except Exception:
-        return None
+        return None, "missing_langchain_openai", {}
 
-    llm = ChatOpenAI(model=os.getenv("PROTOTYPE_DS_PLAN_MODEL", "gpt-4o-mini"), temperature=0)
-    prompt = (
+    llm = ChatOpenAI(model=os.getenv("PROTOTYPE_DS2_PLAN_MODEL", "gpt-4o-mini"), temperature=0)
+    structured = llm.with_structured_output(AnalysisPlan)
+    system = (
         f"{PLAN_SYSTEM.strip()}\n\n"
-        "Return JSON with this shape exactly:\n"
-        "{"
-        "\"member_id\":\"...\","
-        "\"start_date\":\"YYYY-MM-DD\","
-        "\"end_date\":\"YYYY-MM-DD\","
-        "\"types\":[\"cycling\"],"
-        "\"steps\":[{\"tool\":\"summarize_time_series\",\"args\":{\"metrics\":[\"duration_min\"],\"freq\":\"W\"}}]"
-        "}\n\n"
+        "Output must strictly match the AnalysisPlan schema and use valid step argument shapes.\n"
+        "For segment_by, args.by must always be a list of dimensions, never a scalar string."
+    )
+    user = (
         f"User request: {user_text}\n"
-        f"Defaults: member_id={member_id}, start_date={start_date}, end_date={end_date}, types={types}, suggested_metrics={metrics}\n"
+        f"Defaults: member_id={member_id}, start_date={start_date}, end_date={end_date}, "
+        f"types={types}, suggested_metrics={metrics}\n"
     )
     try:
-        resp = llm.invoke(prompt)
-        text = getattr(resp, "content", str(resp))
-        parsed = _safe_json_extract(text)
-        if not parsed:
-            return None
-        candidate = {
-            "member_id": member_id,
-            "start_date": start_date,
-            "end_date": end_date,
-            "types": types,
-            "steps": parsed.get("steps", []),
+        resp = structured.invoke([("system", system), ("user", user)])
+    except Exception as exc:
+        return None, f"invoke_error:{exc.__class__.__name__}", {}
+
+    if not resp:
+        return None, "no_structured_output", {}
+
+    try:
+        if isinstance(resp, AnalysisPlan):
+            model_out = resp
+            model_debug = model_out.model_dump()
+        elif isinstance(resp, dict):
+            model_out = AnalysisPlan.model_validate(resp)
+            model_debug = dict(resp)
+        else:
+            as_dict = resp.model_dump() if hasattr(resp, "model_dump") else {}
+            model_out = AnalysisPlan.model_validate(as_dict)
+            model_debug = as_dict
+    except ValidationError as exc:
+        debug_obj = resp.model_dump() if hasattr(resp, "model_dump") else str(resp)
+        return None, "plan_schema_validation_failed", {
+            "structured_output_excerpt": json.dumps(debug_obj, ensure_ascii=True)[:400],
+            "validation_errors": exc.errors()[:3],
         }
+
+    normalized_parsed = _normalize_llm_plan_payload(model_debug)
+    candidate = {
+        "member_id": member_id,
+        "start_date": start_date,
+        "end_date": end_date,
+        "types": types,
+        "steps": normalized_parsed.get("steps", []),
+    }
+    try:
         plan_model = AnalysisPlan.model_validate(candidate)
-        return _coerce_plan_from_model(
-            plan_model,
-            member_id=member_id,
-            start_date=start_date,
-            end_date=end_date,
-            types=types,
-        )
-    except ValidationError:
-        return None
-    except Exception:
-        return None
+    except ValidationError as exc:
+        return None, "plan_schema_validation_failed", {
+            "raw_response_excerpt": text[:400],
+            "parsed_excerpt": json.dumps(normalized_parsed, ensure_ascii=True)[:400],
+            "validation_errors": exc.errors()[:3],
+        }
+
+    plan = _coerce_plan_from_model(
+        plan_model,
+        member_id=member_id,
+        start_date=start_date,
+        end_date=end_date,
+        types=types,
+    )
+    if not plan:
+        return None, "no_valid_steps_after_coercion", {
+            "parsed_excerpt": json.dumps(normalized_parsed, ensure_ascii=True)[:400],
+        }
+    return plan, "ok", {}
 
 
 def _plan_from_query(user_text: str, member_id: str, start_date: str, end_date: str, types: Optional[List[str]]) -> Dict[str, Any]:
     tl = user_text.lower()
     metrics = _pick_metrics(user_text, types=types)
     scores = _intent_scores(user_text)
-    llm_plan = _maybe_llm_plan(
+    llm_plan, llm_plan_reason, llm_plan_debug = _maybe_llm_plan(
         user_text=user_text,
         member_id=member_id,
         start_date=start_date,
@@ -635,6 +749,10 @@ def _plan_from_query(user_text: str, member_id: str, start_date: str, end_date: 
     )
     if llm_plan:
         llm_plan["planner_mode"] = "llm"
+        llm_plan["llm_plan_attempted"] = True
+        llm_plan["llm_plan_reason"] = llm_plan_reason
+        if llm_plan_debug:
+            llm_plan["llm_plan_debug"] = llm_plan_debug
         llm_plan["intent_scores"] = scores
         llm_plan["metrics_selected"] = metrics
         return llm_plan
@@ -720,6 +838,10 @@ def _plan_from_query(user_text: str, member_id: str, start_date: str, end_date: 
         )
 
     out["planner_mode"] = "heuristic"
+    out["llm_plan_attempted"] = llm_plan_reason != "disabled_by_env"
+    out["llm_plan_reason"] = llm_plan_reason
+    if llm_plan_debug:
+        out["llm_plan_debug"] = llm_plan_debug
     out["intent_scores"] = scores
     out["metrics_selected"] = metrics
     return out
@@ -761,6 +883,52 @@ def _slope_direction(slope: Optional[float]) -> str:
     if slope < -0.02:
         return "downward"
     return "mostly flat"
+
+
+def _aggregate_anomaly_results(tool_results: Dict[str, Any]) -> Dict[str, Any]:
+    anomaly_keys = sorted([k for k in tool_results.keys() if "detect_anomalies" in k])
+    total_outliers = 0
+    by_metric: Dict[str, int] = {}
+    examples: List[Dict[str, Any]] = []
+
+    for key in anomaly_keys:
+        out = tool_results.get(key, {})
+        outliers = out.get("outliers", [])
+        if not isinstance(outliers, list):
+            continue
+        if not outliers:
+            continue
+
+        metric = "unknown_metric"
+        first = outliers[0]
+        if isinstance(first, dict):
+            metric_candidates = [k for k in first.keys() if k not in {"workout_id", "date", "type"}]
+            if metric_candidates:
+                metric = metric_candidates[0]
+
+        outlier_count = len(outliers)
+        total_outliers += outlier_count
+        by_metric[metric] = by_metric.get(metric, 0) + outlier_count
+
+        if len(examples) < 3:
+            sample = outliers[0]
+            if isinstance(sample, dict):
+                examples.append(
+                    {
+                        "metric": metric,
+                        "workout_id": sample.get("workout_id"),
+                        "date": sample.get("date"),
+                        "type": sample.get("type"),
+                        "value": sample.get(metric),
+                    }
+                )
+
+    return {
+        "step_count": len(anomaly_keys),
+        "outlier_count": total_outliers,
+        "outliers_by_metric": by_metric,
+        "outlier_examples": examples,
+    }
 
 
 def _interpret_results(user_text: str, plan: Dict[str, Any], tool_results: Dict[str, Any]) -> str:
@@ -818,12 +986,98 @@ def _interpret_results(user_text: str, plan: Dict[str, Any], tool_results: Dict[
     else:
         lines.append("- Analysis reflects logged workouts only; missing or sparse HR fields can affect zone metrics.")
 
-    anomaly_keys = [k for k in tool_results.keys() if "detect_anomalies" in k]
-    if anomaly_keys:
-        outliers = tool_results[anomaly_keys[0]].get("outliers", [])
-        lines.append(f"- Detected {len(outliers)} potential outlier workout(s) using IQR bounds.")
+    anomaly_summary = _aggregate_anomaly_results(tool_results)
+    if anomaly_summary["step_count"] > 0:
+        metric_counts = anomaly_summary["outliers_by_metric"]
+        metric_part = ", ".join([f"{m}={c}" for m, c in metric_counts.items()]) if metric_counts else "no outliers"
+        lines.append(
+            f"- Detected {anomaly_summary['outlier_count']} potential outlier workout(s) "
+            f"across {anomaly_summary['step_count']} anomaly check(s) using IQR bounds ({metric_part})."
+        )
 
     return "\n".join(lines)
+
+
+def _summarize_tool_results_for_prompt(tool_results: Dict[str, Any]) -> Dict[str, Any]:
+    summary: Dict[str, Any] = {
+        "row_count": tool_results.get("read_workouts", {}).get("row_count", 0),
+        "trend_metrics": {},
+        "top_zone": None,
+        "segments": [],
+        "outlier_count": 0,
+    }
+
+    trend_keys = [k for k in tool_results.keys() if "summarize_time_series" in k]
+    if trend_keys:
+        trends = tool_results[trend_keys[0]].get("trends", {})
+        if isinstance(trends, dict):
+            for metric, payload in trends.items():
+                summary["trend_metrics"][metric] = {
+                    "slope_per_period": payload.get("slope_per_period"),
+                    "direction": _slope_direction(payload.get("slope_per_period")),
+                }
+
+    zone_keys = [k for k in tool_results.keys() if "zone_distribution" in k]
+    if zone_keys:
+        zone = tool_results[zone_keys[0]].get("overall_zone_pct", {})
+        if isinstance(zone, dict) and zone and "note" not in zone:
+            top_zone = max(zone.items(), key=lambda kv: kv[1])
+            summary["top_zone"] = {"zone": top_zone[0], "share": round(float(top_zone[1]), 4)}
+
+    seg_keys = [k for k in tool_results.keys() if "segment_by" in k]
+    if seg_keys:
+        segments = tool_results[seg_keys[0]].get("segments", [])
+        if isinstance(segments, list):
+            summary["segments"] = segments[:5]
+
+    anomaly_summary = _aggregate_anomaly_results(tool_results)
+    summary["outlier_count"] = anomaly_summary["outlier_count"]
+    summary["anomaly_step_count"] = anomaly_summary["step_count"]
+    summary["outliers_by_metric"] = anomaly_summary["outliers_by_metric"]
+    summary["outlier_examples"] = anomaly_summary["outlier_examples"]
+
+    return summary
+
+
+def _maybe_llm_interpret_results(user_text: str, plan: Dict[str, Any], tool_results: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    if not os.getenv("OPENAI_API_KEY"):
+        return None
+    if os.getenv("PROTOTYPE_DS_USE_LLM_INTERPRET", "1").strip().lower() not in {"1", "true", "yes"}:
+        return None
+    try:
+        from langchain_openai import ChatOpenAI
+    except Exception:
+        return None
+
+    compact_results = _summarize_tool_results_for_prompt(tool_results)
+    system = (
+        "You are a cautious workout analytics explainer.\n"
+        "Use only the provided computed results.\n"
+        "Do not invent values.\n"
+        "Return JSON with keys: response_text, confidence, rationale.\n"
+        "The response should be concise with sections: key takeaways, likely drivers, next experiment, limitations."
+    )
+    user = (
+        f"USER_REQUEST: {user_text}\n"
+        f"PLAN: {json.dumps(plan, ensure_ascii=True)}\n"
+        f"COMPUTED_RESULTS_SUMMARY: {json.dumps(compact_results, ensure_ascii=True)}\n"
+    )
+    try:
+        llm = ChatOpenAI(model=os.getenv("PROTOTYPE_DS_INTERPRET_MODEL", "gpt-4o-mini"), temperature=0.1)
+        structured = llm.with_structured_output(InterpretationOutput)
+        out = structured.invoke([("system", system), ("user", user)])
+        if not out:
+            return None
+        response_text = _normalize_interpretation_response_text(str(out.response_text).strip())
+        if len(response_text) < 40:
+            return None
+        return {
+            "response_text": response_text,
+            "confidence": round(float(out.confidence), 3),
+            "rationale": str(out.rationale).strip()[:280],
+        }
+    except Exception:
+        return None
 
 
 def _plan_node(state: DataScienceStoryState) -> DataScienceStoryState:
@@ -879,8 +1133,26 @@ def _interpret_node(state: DataScienceStoryState) -> DataScienceStoryState:
     rows = state.get("rows", [])
     if not rows:
         return {}
-    response_text = _interpret_results(state.get("user_text", ""), state["plan"], state.get("tool_results", {}))
-    return {"response_text": response_text, "follow_up_question": None}
+    user_text = state.get("user_text", "")
+    plan = state["plan"]
+    tool_results = state.get("tool_results", {})
+    llm_out = _maybe_llm_interpret_results(user_text, plan, tool_results)
+    if llm_out and float(llm_out.get("confidence", 0.0)) >= 0.62:
+        return {
+            "response_text": str(llm_out["response_text"]),
+            "follow_up_question": None,
+            "interpretation_source": "llm_grounded",
+            "interpretation_confidence": float(llm_out["confidence"]),
+            "interpretation_rationale": str(llm_out.get("rationale", "")),
+        }
+    response_text = _interpret_results(user_text, plan, tool_results)
+    return {
+        "response_text": response_text,
+        "follow_up_question": None,
+        "interpretation_source": "deterministic_template",
+        "interpretation_confidence": 0.0,
+        "interpretation_rationale": "Template interpretation fallback.",
+    }
 
 
 def _route_after_plan(state: DataScienceStoryState) -> str:
@@ -943,6 +1215,9 @@ def run_data_science_story2(req: StoryRequest) -> StoryResult:
     row_count = int(state_out.get("row_count", len(rows_sorted)))
     tool_results = state_out.get("tool_results", {})
     response_text = state_out.get("response_text") or "I can analyze your workout trends."
+    interpretation_source = str(state_out.get("interpretation_source") or "deterministic_template")
+    interpretation_confidence = float(state_out.get("interpretation_confidence", 0.0))
+    interpretation_rationale = str(state_out.get("interpretation_rationale") or "")
 
     return StoryResult(
         story_id=req.story_id,
@@ -955,6 +1230,9 @@ def run_data_science_story2(req: StoryRequest) -> StoryResult:
             "row_count": len(rows_sorted),
             "plan": plan,
             "tool_results": tool_results,
+            "interpretation_source": interpretation_source,
+            "interpretation_confidence": round(interpretation_confidence, 3),
+            "interpretation_rationale": interpretation_rationale,
             "generated_on": date.today().isoformat(),
         },
         state_updates_global={"member": {"member_id": member_id}} if member_id else {},
