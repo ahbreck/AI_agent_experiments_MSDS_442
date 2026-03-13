@@ -1,17 +1,32 @@
 # Project Phase 3 Prototype
 
-## Features
+## Application Overview
+This prototype is an agentic demonstration of an AI assistant for Peloton Fitness. It routes each user request to one of three business domains, selects the best matching in-domain story, runs the story workflow, and returns a grounded response while preserving multi-turn state.
+
+Core architecture:
 - Top-level orchestrator router (domain routing).
 - In-domain story router.
 - Layered state (`GlobalState` + per-domain context).
 - Memory checkpointer (`MemorySaver`) keyed by `thread_id` for multi-user simulation.
-- Current wired stories:
-  - `bm_story_1`
-  - `bm_story_2`
-  - `bm_story_3`
-  - `ds_story_2`
-  - `mf_story_1`
-  - `mf_story_2`
+- Catalog-driven stories in `Project_Phase_3/prototype/catalog.py`.
+
+## Domains and User Stories
+The application currently covers three domains with three user stories in each domain:
+
+### 1) Business & Marketing
+- `bm_story_1` - **Campaign Feedback Themes + Adjustments**: summarizes campaign feedback themes and recommends campaign changes.
+- `bm_story_2` - **Weekly Campaign Metric Diagnostics**: analyzes weekly metric performance (for example CTR/CAC/ROAS) and highlights underperformance drivers.
+- `bm_story_3` - **Lead Prioritization + Follow-up Drafts**: prioritizes sales leads from behavior and intent signals, then drafts follow-up outreach.
+
+### 2) Data Science
+- `ds_story_1` - **Workout Data Visualization Builder**: creates chart-oriented views of workout data based on user analysis goals.
+- `ds_story_2` - **Workout Trend Analytics**: analyzes workout trends and performance patterns (for example zones, cadence, improvement signals).
+- `ds_story_3` - **Peer Benchmark Comparison + Improvement Suggestions**: compares a member's workout profile to peers and suggests improvement actions.
+
+### 3) Membership & Fraud
+- `mf_story_1` - **Security Event Explanation + Actions**: explains suspicious security events and fields user questions about related account-protection actions.
+- `mf_story_2` - **Account Issue Triage + Queue Routing**: classifies support issues (login, billing, renewal) and routes to the right support queue.
+- `mf_story_3` - **Membership Tier Fit + Upgrade/Downgrade Guidance**: evaluates tier utilization and recommends keeping, upgrading, or downgrading membership tier.
 
 ## Environment Setup (Conda, Recommended)
 This repo ships an `environment.yml` at the repository root. Use it as the source of truth.
@@ -83,6 +98,12 @@ From repo root:
 .\scripts\run_phase3_tests.ps1
 ```
 
+Direct run (if your `msds_442` environment is already active):
+
+```powershell
+python -m unittest Project_Phase_3.tests.test_membership_fraud_story2 Project_Phase_3.tests.test_orchestrator_membership_fraud_routing Project_Phase_3.tests.test_business_marketing_story3
+```
+
 These helper scripts first try the active conda environment, then `conda run`, then common local conda env paths.
 
 ## Build Membership-Fraud Issue KB Vectors (RAG)
@@ -98,12 +119,6 @@ This builds:
 - `renewal_help_chroma`
 
 Re-run the command only when the corresponding `*_help_kb.jsonl` content changes.
-
-Direct run (if your `msds_442` environment is already active):
-
-```powershell
-python -m unittest Project_Phase_3.tests.test_membership_fraud_story2 Project_Phase_3.tests.test_orchestrator_membership_fraud_routing Project_Phase_3.tests.test_business_marketing_story3
-```
 
 ## Add a New Story
 1. Add a handler in `Project_Phase_3/prototype/stories/`.
