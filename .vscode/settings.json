@@ -1,7 +1,6 @@
 {
   "python.envFile": "${workspaceFolder}/.env",
   "python.terminal.activateEnvironment": false,
-  "python.defaultInterpreterPath": "C:\\Users\\ahbre\\anaconda3\\envs\\msds_442\\python.exe",
   "python.testing.unittestEnabled": true,
   "python.testing.pytestEnabled": false,
   "python.testing.unittestArgs": [
