@@ -98,6 +98,38 @@ class TestBusinessMarketingStory3(unittest.TestCase):
         self.assertEqual(payload.get("top_n"), 5)
         self.assertEqual(payload.get("tone"), "consultative")
 
+    def test_refinement_top_n_bounds_ranked_leads(self):
+        prior_domain_context = {
+            "bm_story_3_state": {
+                "last_user_turn_number": 2,
+                "last_resolved_plan": {
+                    "lookback_days": 14,
+                    "channel": "email",
+                    "tone": "friendly",
+                    "top_n": 10,
+                    "primary_class_interest": ["Cycling"],
+                },
+                "field_resolution": {
+                    "lookback_days": {"source": "explicit", "confidence": 0.9},
+                    "channel": {"source": "explicit", "confidence": 0.9},
+                    "primary_class_interest": {"source": "explicit", "confidence": 0.9},
+                },
+            }
+        }
+        msgs = [
+            {"role": "user", "content": "Generate top leads and draft follow-ups"},
+            {"role": "user", "content": "Use last 14 days and email channel, focus on cycling"},
+        ]
+        out = self._invoke(
+            "Make tone consultative and show top 5",
+            messages=msgs,
+            domain_context=prior_domain_context,
+        )
+        payload = out.story_output
+        ranked = payload.get("ranked_leads", [])
+        self.assertEqual(payload.get("top_n"), 5)
+        self.assertLessEqual(len(ranked), 5)
+
 
 if __name__ == "__main__":
     unittest.main()

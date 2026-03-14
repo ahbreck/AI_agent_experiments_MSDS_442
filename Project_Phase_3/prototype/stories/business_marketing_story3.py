@@ -137,6 +137,16 @@ def _query_has_explicit_interest(user_text: str) -> bool:
     return bool(re.search(r"\b(cycling|yoga|strength|running)\b", text))
 
 
+def _query_requests_all_interests(user_text: str) -> bool:
+    text = user_text.lower()
+    if re.search(r"\b(all|any)\s+(interests?|classes?|categories?)\b", text):
+        return True
+    if re.search(r"\b(top\s+\d{1,3}\s+)?leads?\b", text) and not _query_has_explicit_interest(text):
+        # "top N leads" without an explicit interest is treated as a broad-scope request.
+        return True
+    return False
+
+
 def _query_has_explicit_top_n(user_text: str) -> bool:
     return re.search(r"\btop\s+(\d{1,3})\b", user_text.lower()) is not None
 
@@ -233,6 +243,7 @@ def _merge_with_prior_plan(
     explicit_lookback = _query_has_explicit_lookback(user_text)
     explicit_channel = _query_has_explicit_channel(user_text)
     explicit_interest = _query_has_explicit_interest(user_text)
+    explicit_all_interests = _query_requests_all_interests(user_text)
     explicit_top_n = _query_has_explicit_top_n(user_text)
     explicit_tone = _query_has_explicit_tone(user_text)
 
@@ -261,7 +272,18 @@ def _merge_with_prior_plan(
         carry("lookback_days", int(prior_plan["lookback_days"]))
     if not explicit_channel and "channel" in prior_plan:
         carry("channel", str(prior_plan["channel"]))
-    if not explicit_interest and "primary_class_interest" in prior_plan:
+    if explicit_all_interests:
+        out["primary_class_interest"] = None
+        fr = dict(out.get("field_resolution", {}).get("primary_class_interest", {}))
+        fr["source"] = "explicit"
+        fr["evidence"] = "Detected broad lead request; cleared prior interest filter to include all interests."
+        out["field_resolution"]["primary_class_interest"] = fr
+        _clear_clarification_for_field(out, "primary_class_interest")
+        _drop_assumptions(("inferred primary_class_interest=",))
+        out["assumptions"].append(
+            "Interpreted request as all-interest scope; prior primary_class_interest filter was cleared."
+        )
+    elif not explicit_interest and "primary_class_interest" in prior_plan:
         out["primary_class_interest"] = prior_plan["primary_class_interest"]
         carry("primary_class_interest", prior_plan["primary_class_interest"])
 
@@ -352,16 +374,9 @@ def _resolve_request_plan(user_text: str) -> Dict[str, Any]:
         deterministic["planning_rationale"] = "LLM planner unavailable; used deterministic parser."
         return deterministic
 
+    # Keep assumptions deterministic/system-generated only.
+    # LLM free-form assumption text can introduce pseudo-factual phrasing.
     assumptions = list(deterministic["assumptions"])
-    for item in llm_plan.assumptions:
-        txt = str(item or "").strip()
-        if not txt:
-            continue
-        low = txt.lower()
-        if any(term in low for term in ("based on recent engagement", "based on previous", "effective", "most responsive", "past interactions", "recent trends", "lead behavior")):
-            continue
-        if txt not in assumptions:
-            assumptions.append(txt)
 
     explicit_lookback = _query_has_explicit_lookback(user_text)
     explicit_channel = _query_has_explicit_channel(user_text)
@@ -1141,6 +1156,10 @@ def run_business_marketing_story3(req: StoryRequest) -> StoryResult:
     response_text = state_out.get("response_text") or "I can prioritize leads and draft outreach follow-ups."
     lookback_days = int(plan.get("lookback_days", DEFAULT_LOOKBACK_DAYS))
     channel = str(plan.get("channel", DEFAULT_CHANNEL))
+    top_n = int(plan.get("top_n", DEFAULT_TOP_N))
+    if top_n > 0 and len(ranked) > top_n:
+        # Defensive invariant: keep payload aligned with requested top_n.
+        ranked = ranked[:top_n]
 
     return StoryResult(
         story_id=req.story_id,
@@ -1150,7 +1169,7 @@ def run_business_marketing_story3(req: StoryRequest) -> StoryResult:
             "lookback_days": lookback_days,
             "channel": channel,
             "tone": str(plan.get("tone", DEFAULT_TONE)),
-            "top_n": int(plan.get("top_n", DEFAULT_TOP_N)),
+            "top_n": top_n,
             "filters": {"primary_class_interest": plan.get("primary_class_interest")},
             "assumptions": list(plan.get("assumptions", [])),
             "planning_source": str(plan.get("planning_source", "deterministic")),
