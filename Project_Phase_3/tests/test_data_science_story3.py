@@ -13,6 +13,7 @@ if str(PHASE3_ROOT) not in sys.path:
 from prototype.contracts import CanonicalMember, StoryRequest  # noqa: E402
 from prototype.stories.data_science_story3 import run_data_science_story3  # noqa: E402
 from prototype.stories.data_science_story3 import PlanOutput, PeerDefinition, MetricSelection  # noqa: E402
+from prototype.stories.data_science_story3 import compare_to_peers  # noqa: E402
 
 
 class TestDataScienceStory3(unittest.TestCase):
@@ -71,7 +72,7 @@ class TestDataScienceStory3(unittest.TestCase):
         self.assertFalse(any(str(a).startswith("Used default metrics:") for a in assumptions))
 
     def test_story_output_schema_and_guardrails(self):
-        out = self._invoke("Compare MB001 weekly workouts and consistency to peers for last 8 weeks.")
+        out = self._invoke("Compare MB001 weekly workouts and consistency to all peers for last 8 weeks.")
         payload = out.story_output
         required = {
             "member_id",
@@ -115,13 +116,20 @@ class TestDataScienceStory3(unittest.TestCase):
                 self.assertEqual(pct_delta, round((expected_delta / float(peer_value)) * 100.0, 2))
 
     def test_suggestions_match_negative_gaps(self):
-        out = self._invoke("Compare MB001 to peers for weekly workouts, session length, and consistency.")
+        out = self._invoke("Compare MB001 to all peers for weekly workouts, session length, and consistency.")
         payload = out.story_output
         comparisons = payload.get("comparisons", {})
         negative_metrics = {m for m, row in comparisons.items() if isinstance(row.get("delta"), (int, float)) and row.get("delta") < 0}
+        known_metrics = {"weekly_workouts", "avg_session_length_min", "consistency_ratio"}
 
-        for suggestion in payload.get("suggestions", []):
-            self.assertIn(suggestion.get("metric"), negative_metrics)
+        suggestions = payload.get("suggestions", [])
+        if negative_metrics:
+            for suggestion in suggestions:
+                self.assertIn(suggestion.get("metric"), negative_metrics)
+        else:
+            self.assertTrue(len(suggestions) >= 1)
+            for suggestion in suggestions:
+                self.assertIn(suggestion.get("metric"), known_metrics)
 
     def test_missing_benchmark_skips_recommendations_for_unavailable_metrics(self):
         mock_peer = {
@@ -136,7 +144,7 @@ class TestDataScienceStory3(unittest.TestCase):
             "limitation": "Insufficient aggregated peer benchmark data for this cohort/timeframe.",
         }
         with patch("prototype.stories.data_science_story3._read_peer_aggregate_metrics", return_value=mock_peer):
-            out = self._invoke("Compare MB001 weekly workouts, session length, and consistency to peers for last 8 weeks.")
+            out = self._invoke("Compare MB001 weekly workouts, session length, and consistency to all peers for last 8 weeks.")
 
         payload = out.story_output
         suggestions = payload.get("suggestions", [])
@@ -145,15 +153,15 @@ class TestDataScienceStory3(unittest.TestCase):
         self.assertNotIn("consistency_ratio", suggestion_metrics)
         self.assertIn("aggregated benchmarks", out.response_text.lower())
 
-    def test_hybrid_gate_skips_llm_when_uncertainty_low(self):
+    def test_llm_attempted_on_first_pass_when_enabled(self):
         query = "Compare MB001 weekly workouts and consistency to all peers over the last 8 weeks."
         with patch.dict(os.environ, {"PROTOTYPE_DS3_USE_LLM_PLAN": "1"}):
-            with patch("prototype.stories.data_science_story3._maybe_llm_plan") as mocked_llm:
+            with patch("prototype.stories.data_science_story3._maybe_llm_plan", return_value=None) as mocked_llm:
                 out = self._invoke(query)
-        mocked_llm.assert_not_called()
-        self.assertEqual((out.story_output or {}).get("planner_source"), "deterministic_fallback")
+        mocked_llm.assert_called_once()
+        self.assertEqual((out.story_output or {}).get("planner_source"), "deterministic_fallback_llm_unavailable")
 
-    def test_hybrid_gate_uses_llm_when_uncertainty_high(self):
+    def test_llm_plan_is_used_when_available_and_valid(self):
         llm_plan = PlanOutput(
             member_id="MB001",
             timeframe="last_8_weeks",
@@ -191,6 +199,80 @@ class TestDataScienceStory3(unittest.TestCase):
             with patch("prototype.stories.data_science_story3._maybe_llm_plan", return_value=low_conf_llm_plan):
                 out = self._invoke("Compare MB001 metrics to peers.")
         self.assertEqual((out.story_output or {}).get("planner_source"), "deterministic_fallback_llm_low_confidence")
+
+    def test_cohort_language_triggers_peer_definition_clarification(self):
+        llm_plan = PlanOutput(
+            member_id="MB001",
+            timeframe="last_4_weeks",
+            peer_definition=PeerDefinition(scope="same_primary_type", rationale="llm"),
+            metrics=MetricSelection(selected=["weekly_workouts", "avg_session_length_min"], inferred=[]),
+            assumptions=[],
+            ambiguities=[],
+            needs_clarification=False,
+            requested_slot=None,
+            clarifying_question=None,
+            planner_confidence=0.9,
+        )
+        with patch.dict(os.environ, {"PROTOTYPE_DS3_USE_LLM_PLAN": "1"}):
+            with patch("prototype.stories.data_science_story3._maybe_llm_plan", return_value=llm_plan):
+                out = self._invoke("What should I improve compared to others in my cohort?", member_id="MB001")
+        payload = out.story_output
+        self.assertTrue(payload.get("needs_clarification"))
+        self.assertEqual(payload.get("requested_slot"), "peer_definition")
+        self.assertIsNotNone(out.follow_up_question)
+
+    def test_not_everyone_phrase_never_uses_all_members_scope(self):
+        llm_plan = PlanOutput(
+            member_id="MB001",
+            timeframe="last_8_weeks",
+            peer_definition=PeerDefinition(scope="all_members", rationale="llm broad scope"),
+            metrics=MetricSelection(selected=["weekly_workouts", "avg_session_length_min", "consistency_ratio"], inferred=[]),
+            assumptions=[],
+            ambiguities=[],
+            needs_clarification=False,
+            requested_slot=None,
+            clarifying_question=None,
+            planner_confidence=0.9,
+        )
+        with patch.dict(os.environ, {"PROTOTYPE_DS3_USE_LLM_PLAN": "1"}):
+            with patch("prototype.stories.data_science_story3._maybe_llm_plan", return_value=llm_plan):
+                out = self._invoke("Compare MB001 to others but not everyone.")
+        scope = ((out.story_output or {}).get("plan_snapshot") or {}).get("peer_definition", {}).get("scope")
+        self.assertNotEqual(scope, "all_members")
+
+    def test_focus_on_what_matters_limits_to_priority_metrics(self):
+        llm_plan = PlanOutput(
+            member_id="MB001",
+            timeframe="last_8_weeks",
+            peer_definition=PeerDefinition(scope="similar_activity_band", rationale="llm"),
+            metrics=MetricSelection(
+                selected=["weekly_workouts", "avg_session_length_min", "consistency_ratio"],
+                inferred=[],
+            ),
+            assumptions=[],
+            ambiguities=[],
+            needs_clarification=False,
+            requested_slot=None,
+            clarifying_question=None,
+            planner_confidence=0.9,
+        )
+        with patch.dict(os.environ, {"PROTOTYPE_DS3_USE_LLM_PLAN": "1"}):
+            with patch("prototype.stories.data_science_story3._maybe_llm_plan", return_value=llm_plan):
+                out = self._invoke("Compare me to peers and focus on what matters most. My member ID is MB001.")
+        selected = ((out.story_output or {}).get("plan_snapshot") or {}).get("metrics", {}).get("selected", [])
+        self.assertEqual(selected, ["weekly_workouts", "consistency_ratio"])
+
+    def test_strength_ranking_uses_percent_delta_not_raw_units(self):
+        compared = compare_to_peers(
+            member_data={"weekly_workouts": 3.0, "avg_session_length_min": 40.0},
+            peer_data={
+                "benchmarks": {"weekly_workouts": 2.0, "avg_session_length_min": 30.0},
+                "availability": {"weekly_workouts": True, "avg_session_length_min": True},
+            },
+            selected_metrics=["weekly_workouts", "avg_session_length_min"],
+        )
+        # Weekly has smaller raw delta (1 vs 10) but larger percent delta (50% vs 33.33%).
+        self.assertEqual(compared.get("strengths"), ["weekly_workouts"])
 
 
 if __name__ == "__main__":

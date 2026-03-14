@@ -14,6 +14,7 @@ import argparse
 import csv
 import shutil
 import sqlite3
+from contextlib import closing
 import zlib
 from datetime import datetime
 from pathlib import Path
@@ -66,7 +67,7 @@ def update_csv(apply: bool) -> int:
 
 
 def update_sqlite(apply: bool) -> int:
-    with sqlite3.connect(DB_PATH) as conn:
+    with closing(sqlite3.connect(DB_PATH)) as conn:
         cur = conn.cursor()
         cols = [r[1] for r in cur.execute("PRAGMA table_info(campaign_feedback)")]
         if "member_id" not in cols and apply:

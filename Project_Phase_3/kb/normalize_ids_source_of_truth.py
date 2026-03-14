@@ -15,6 +15,7 @@ import csv
 import re
 import shutil
 import sqlite3
+from contextlib import closing
 from collections import defaultdict
 from datetime import datetime
 from pathlib import Path
@@ -84,7 +85,7 @@ def collision_map(pairs: Iterable[Tuple[str, str]]) -> Dict[str, List[str]]:
 
 def normalize_sqlite(path: Path, table_columns: Dict[str, List[str]], apply: bool) -> Dict[str, object]:
     summary: Dict[str, object] = {"path": str(path), "type": "sqlite", "updated_cells": 0, "collisions": {}}
-    with sqlite3.connect(path) as conn:
+    with closing(sqlite3.connect(path)) as conn:
         conn.row_factory = sqlite3.Row
         cur = conn.cursor()
         all_updates: List[Tuple[str, str, str, object]] = []

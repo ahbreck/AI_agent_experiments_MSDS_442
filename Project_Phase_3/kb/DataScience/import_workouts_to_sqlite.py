@@ -7,6 +7,7 @@ Example:
 
 import argparse
 import sqlite3
+from contextlib import closing
 import pandas as pd
 
 
@@ -51,7 +52,7 @@ def main():
 
     df = pd.read_csv(args.csv)
 
-    with sqlite3.connect(args.db) as conn:
+    with closing(sqlite3.connect(args.db)) as conn:
         cur = conn.cursor()
 
         if args.replace:

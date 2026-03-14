@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import re
 import sqlite3
+from contextlib import closing
 from datetime import date
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple, TypedDict
@@ -979,7 +980,7 @@ def _validate_plan_node(state: Story3GraphState) -> Story3GraphState:
 
 def _read_signals_node(state: Story3GraphState) -> Story3GraphState:
     plan = state["plan"]
-    with sqlite3.connect(DB_PATH) as conn:
+    with closing(sqlite3.connect(DB_PATH)) as conn:
         as_of_date = _read_as_of_date(conn)
         if not as_of_date:
             msg = "No lead engagement signal data is available yet."
@@ -1012,7 +1013,7 @@ def _score_node(state: Story3GraphState) -> Story3GraphState:
     candidate_rows = state.get("candidate_rows", [])
     if state.get("response_text"):
         return {}
-    with sqlite3.connect(DB_PATH) as conn:
+    with closing(sqlite3.connect(DB_PATH)) as conn:
         ranked, suppression_stats = score_and_rank_leads(
             conn,
             data=candidate_rows,
@@ -1028,7 +1029,7 @@ def _enrich_drafts_node(state: Story3GraphState) -> Story3GraphState:
     if not ranked:
         return {}
     plan = state["plan"]
-    with sqlite3.connect(DB_PATH) as conn:
+    with closing(sqlite3.connect(DB_PATH)) as conn:
         for lead in ranked:
             intent = infer_intent_from_signals(conn, lead)
             template = select_message_template(

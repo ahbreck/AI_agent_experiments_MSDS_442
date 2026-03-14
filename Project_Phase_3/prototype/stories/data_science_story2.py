@@ -4,6 +4,7 @@ import json
 import os
 import re
 import sqlite3
+from contextlib import closing
 from collections import defaultdict
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -385,7 +386,7 @@ def _read_workouts(member_id: str, start_date: str, end_date: str, types: Option
         q += f" AND LOWER(type) IN ({','.join(['?'] * len(types))})"
         params.extend([t.lower() for t in types])
 
-    with sqlite3.connect(DB_PATH) as conn:
+    with closing(sqlite3.connect(DB_PATH)) as conn:
         register_sqlite_alnum_normalizer(conn)
         conn.row_factory = sqlite3.Row
         return [dict(r) for r in conn.execute(q, params).fetchall()]

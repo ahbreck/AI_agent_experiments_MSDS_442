@@ -4,6 +4,7 @@ import json
 import os
 import re
 import sqlite3
+from contextlib import closing
 from collections import defaultdict
 from datetime import datetime
 from pathlib import Path
@@ -334,7 +335,7 @@ def _read_rows(member_id: Optional[str], start_date: str, end_date: str) -> List
         params.append(member_id)
     sql += " ORDER BY date ASC"
 
-    with sqlite3.connect(DB_PATH) as conn:
+    with closing(sqlite3.connect(DB_PATH)) as conn:
         register_sqlite_alnum_normalizer(conn)
         conn.row_factory = sqlite3.Row
         rows = conn.execute(sql, params).fetchall()

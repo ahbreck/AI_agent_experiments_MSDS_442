@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import re
 import sqlite3
+from contextlib import closing
 from collections import defaultdict
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -1260,7 +1261,7 @@ def _clarify_request_node(state: Story2GraphState) -> Story2GraphState:
 def _read_metrics_node(state: Story2GraphState) -> Story2GraphState:
     user_text = state.get("user_query", "")
     filters = state.get("filters", {})
-    with sqlite3.connect(DB_PATH) as conn:
+    with closing(sqlite3.connect(DB_PATH)) as conn:
         register_sqlite_alnum_normalizer(conn)
         _ensure_threshold_table(conn)
         available_weeks = _get_available_weeks(conn)
@@ -1330,7 +1331,7 @@ def _threshold_eval_node(state: Story2GraphState) -> Story2GraphState:
     threshold_metrics = [m for m in metrics if m in {"click_through_rate", "customer_acquisition_cost", "return_on_ad_spend"}]
     if not threshold_metrics:
         threshold_metrics = ["click_through_rate", "customer_acquisition_cost", "return_on_ad_spend"]
-    with sqlite3.connect(DB_PATH) as conn:
+    with closing(sqlite3.connect(DB_PATH)) as conn:
         register_sqlite_alnum_normalizer(conn)
         _ensure_threshold_table(conn)
         underperformers = _evaluate_underperformance(conn, state.get("clean_summary", {}).get("rows", []), metrics_requested=threshold_metrics)

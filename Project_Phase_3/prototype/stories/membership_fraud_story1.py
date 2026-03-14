@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import re
 import sqlite3
+from contextlib import closing
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict, List, Literal, Optional, TypedDict
@@ -314,7 +315,7 @@ def _read_security_events(member_id: str, timeframe: Timeframe, max_events: int 
         return []
     placeholders = ",".join(["?"] * len(aliases))
 
-    with sqlite3.connect(DB_PATH) as conn:
+    with closing(sqlite3.connect(DB_PATH)) as conn:
         register_sqlite_alnum_normalizer(conn)
         conn.row_factory = sqlite3.Row
         cur = conn.cursor()

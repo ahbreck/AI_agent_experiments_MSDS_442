@@ -4,6 +4,7 @@ from __future__ import annotations
 import os
 import re
 import sqlite3
+from contextlib import closing
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict, List, Literal, Optional, Tuple, TypedDict
@@ -88,6 +89,7 @@ METRIC_KEYWORDS = {
 }
 
 DEFAULT_METRICS: List[MetricName] = ["weekly_workouts", "avg_session_length_min", "consistency_ratio"]
+PRIORITY_METRICS: List[MetricName] = ["weekly_workouts", "consistency_ratio"]
 HYBRID_UNCERTAINTY_THRESHOLD = 0.45
 LLM_MIN_CONFIDENCE = 0.55
 
@@ -132,6 +134,8 @@ def _infer_timeframe_from_text(user_text: str) -> TimeframeLabel:
         return "last_12_weeks"
     if "last month" in tl:
         return "last_4_weeks"
+    if "recently" in tl or "recent" in tl:
+        return "last_4_weeks"
     if "last 3 months" in tl or "past 3 months" in tl or "quarter" in tl:
         return "last_12_weeks"
     return "last_8_weeks"
@@ -158,8 +162,28 @@ def _parse_metrics_from_text(user_text: str) -> Tuple[List[MetricName], List[Met
             selected.append(metric)  # type: ignore[arg-type]
 
     selected = sorted(set(selected), key=selected.index)
-    mentions_generic_metrics = _contains_phrase(tl, "metrics")
-    ambiguous = mentions_generic_metrics and not selected
+    mentions_generic_metrics = any(
+        _contains_phrase(tl, term)
+        for term in [
+            "metric",
+            "metrics",
+            "performance metrics",
+            "right metrics",
+            "what matters most",
+            "focus on what matters",
+            "key metrics",
+        ]
+    )
+    hedged_metric_request = any(
+        _contains_phrase(tl, term)
+        for term in [
+            "or something",
+            "maybe by",
+            "maybe",
+            "not sure which metrics",
+        ]
+    )
+    ambiguous = (mentions_generic_metrics or hedged_metric_request) and not selected
 
     if not selected and not ambiguous:
         return list(DEFAULT_METRICS), list(DEFAULT_METRICS), False
@@ -184,6 +208,16 @@ def _parse_peer_definition_from_text(user_text: str) -> Tuple[PeerDefinition, bo
         elif any(k in tl for k in ["run", "running", "treadmill"]):
             explicit_type = "tread"
 
+    not_everyone = any(k in tl for k in ["not everyone", "not all members", "not all peers"])
+    if not_everyone:
+        return (
+            PeerDefinition(
+                scope="similar_activity_band",
+                rationale="User explicitly excluded broad all-members cohort.",
+            ),
+            False,
+        )
+
     if any(k in tl for k in ["all members", "everyone", "overall peers", "all peers"]):
         return PeerDefinition(scope="all_members", rationale="User asked for broad peer baseline."), False
 
@@ -206,8 +240,29 @@ def _parse_peer_definition_from_text(user_text: str) -> Tuple[PeerDefinition, bo
             False,
         )
 
+    if any(k in tl for k in ["similar users", "people like me", "like me", "fair comparison", "fair peer"]):
+        return (
+            PeerDefinition(
+                scope="similar_activity_band",
+                rationale="User requested a fair comparison to similar users.",
+            ),
+            False,
+        )
+
+    if "cohort" in tl:
+        return (
+            PeerDefinition(
+                scope="similar_activity_band",
+                rationale="User referenced cohort but did not define cohort type.",
+            ),
+            True,
+        )
+
     if "peer" in tl or "peers" in tl:
-        return PeerDefinition(scope="all_members", rationale="Defaulted peer scope to all members."), False
+        return (
+            PeerDefinition(scope="all_members", rationale="Peer scope not specified; using temporary default."),
+            True,
+        )
 
     return PeerDefinition(scope="all_members", rationale="Defaulted peer scope to all members."), True
 
@@ -363,6 +418,24 @@ def _llm_plan_contradictory(plan: PlanOutput) -> bool:
     return False
 
 
+def _slot_question(slot: SlotName) -> str:
+    if slot == "member_id":
+        return "What is your member_id (for example, MB001)?"
+    if slot == "metrics":
+        return "Which metrics should I compare: weekly workouts, session length, consistency, or all three?"
+    if slot == "peer_definition":
+        return "How should I define peers: all members, same workout type, or similar activity level?"
+    return "What timeframe should I use: last 4, 8, or 12 weeks?"
+
+
+def _choose_requested_slot(ambiguities: List[SlotName]) -> Optional[SlotName]:
+    priority: List[SlotName] = ["member_id", "metrics", "peer_definition", "timeframe"]
+    for slot in priority:
+        if slot in ambiguities:
+            return slot
+    return None
+
+
 def _merge_pending_slot_answer(plan: PlanOutput, pending_slot: Optional[str], answer_text: str) -> PlanOutput:
     if pending_slot not in {"member_id", "metrics", "peer_definition", "timeframe"}:
         return plan
@@ -468,7 +541,7 @@ def _read_member_rows(member_id: str, start_date: str, end_date: str) -> List[Di
       AND date >= ?
       AND date <= ?
     """
-    with sqlite3.connect(DB_PATH) as conn:
+    with closing(sqlite3.connect(DB_PATH)) as conn:
         register_sqlite_alnum_normalizer(conn)
         conn.row_factory = sqlite3.Row
         rows = conn.execute(sql, [member_id, start_date, end_date]).fetchall()
@@ -483,7 +556,7 @@ def _read_peer_rows(start_date: str, end_date: str, exclude_member_id: str) -> L
       AND date >= ?
       AND date <= ?
     """
-    with sqlite3.connect(DB_PATH) as conn:
+    with closing(sqlite3.connect(DB_PATH)) as conn:
         register_sqlite_alnum_normalizer(conn)
         conn.row_factory = sqlite3.Row
         rows = conn.execute(sql, [exclude_member_id, start_date, end_date]).fetchall()
@@ -618,8 +691,8 @@ def compare_to_peers(
     strengths: List[str] = []
     primary_gap_metric: Optional[str] = None
 
-    max_positive: Optional[float] = None
-    min_negative: Optional[float] = None
+    max_positive_score: Optional[float] = None
+    min_negative_score: Optional[float] = None
 
     peer_benchmarks = peer_data.get("benchmarks", {})
     availability = peer_data.get("availability", {})
@@ -646,14 +719,19 @@ def compare_to_peers(
             "pct_delta": pct_delta,
         }
 
-        if delta > 0 and (max_positive is None or delta > max_positive):
-            max_positive = delta
+        score = pct_delta if isinstance(pct_delta, (int, float)) else delta
+        if isinstance(score, (int, float)) and score > 0 and (
+            max_positive_score is None or score > max_positive_score
+        ):
+            max_positive_score = score
             strengths = [metric]
-        elif delta > 0 and max_positive is not None and delta == max_positive:
+        elif isinstance(score, (int, float)) and score > 0 and max_positive_score is not None and score == max_positive_score:
             strengths.append(metric)
 
-        if delta < 0 and (min_negative is None or delta < min_negative):
-            min_negative = delta
+        if isinstance(score, (int, float)) and score < 0 and (
+            min_negative_score is None or score < min_negative_score
+        ):
+            min_negative_score = score
             primary_gap_metric = metric
 
     return {
@@ -694,6 +772,49 @@ def generate_improvement_suggestions(gaps: Dict[str, Any]) -> List[Dict[str, str
             }
         )
 
+    if suggestions:
+        return suggestions
+
+    # If no gaps are below benchmark, provide a concrete optimization target
+    # for the narrowest positive margin instead of a generic "keep routine" message.
+    smallest_positive_metric: Optional[str] = None
+    smallest_positive_score: Optional[float] = None
+    for metric, row in comparisons.items():
+        delta = row.get("delta")
+        pct_delta = row.get("pct_delta")
+        if not isinstance(delta, (int, float)):
+            continue
+        if delta < 0:
+            continue
+        score = pct_delta if isinstance(pct_delta, (int, float)) else delta
+        if not isinstance(score, (int, float)):
+            continue
+        if smallest_positive_score is None or score < smallest_positive_score:
+            smallest_positive_score = score
+            smallest_positive_metric = metric
+
+    if smallest_positive_metric == "weekly_workouts":
+        suggestions.append(
+            {
+                "metric": "weekly_workouts",
+                "suggestion": "Your workout frequency is only slightly above peers; protect that edge with one pre-scheduled session each week.",
+            }
+        )
+    elif smallest_positive_metric == "avg_session_length_min":
+        suggestions.append(
+            {
+                "metric": "avg_session_length_min",
+                "suggestion": "Session length is close to peers; try extending one workout by 5-10 minutes each week.",
+            }
+        )
+    elif smallest_positive_metric == "consistency_ratio":
+        suggestions.append(
+            {
+                "metric": "consistency_ratio",
+                "suggestion": "Consistency is your narrowest margin; anchor 2-3 fixed workout days to sustain active weeks.",
+            }
+        )
+
     return suggestions
 
 def _format_metric_line(metric: str, comparison: Dict[str, Optional[float]]) -> str:
@@ -728,11 +849,11 @@ def _plan_request_node(state: PeerBenchmarkState) -> PeerBenchmarkState:
     plan_model = deterministic
 
     llm_enabled = os.getenv("PROTOTYPE_DS3_USE_LLM_PLAN", "0").strip() in {"1", "true", "TRUE"}
-    threshold = float(os.getenv("PROTOTYPE_DS3_UNCERTAINTY_THRESHOLD", str(HYBRID_UNCERTAINTY_THRESHOLD)))
     llm_min_conf = float(os.getenv("PROTOTYPE_DS3_LLM_MIN_CONF", str(LLM_MIN_CONFIDENCE)))
 
-    # Do not switch planning mode mid-clarification; keep deterministic while slot is pending.
-    if llm_enabled and pending_slot is None and uncertainty_score >= threshold:
+    # Run LLM planning whenever enabled on first-pass turns.
+    # Keep deterministic planning during clarification-resume turns.
+    if llm_enabled and pending_slot is None:
         llm_plan_attempted = True
         llm_plan = _maybe_llm_plan(user_text=user_text, fallback_member=fallback_member)
         if llm_plan is None:
@@ -782,25 +903,97 @@ def _merge_user_answer_node(state: PeerBenchmarkState) -> PeerBenchmarkState:
 
 def _validate_plan_node(state: PeerBenchmarkState) -> PeerBenchmarkState:
     plan_dict = state.get("plan") or {}
+    user_text = state.get("user_text", "")
+    tl = user_text.lower()
     try:
         plan = PlanOutput.model_validate(plan_dict)
     except ValidationError:
-        fallback = _deterministic_plan(user_text=state.get("user_text", ""), fallback_member=state.get("fallback_member"))
+        fallback = _deterministic_plan(user_text=user_text, fallback_member=state.get("fallback_member"))
         plan = fallback
 
+    deterministic_metrics_selected, _, deterministic_metrics_ambiguous = _parse_metrics_from_text(user_text)
+    deterministic_peer, deterministic_peer_ambiguous = _parse_peer_definition_from_text(user_text)
+
+    if deterministic_metrics_ambiguous and "metrics" not in plan.ambiguities:
+        plan.ambiguities.append("metrics")
+
+    explicit_peer_scope_phrase = any(
+        k in tl
+        for k in [
+            "all members",
+            "everyone",
+            "all peers",
+            "overall peers",
+            "same type",
+            "same workout type",
+            "same class type",
+            "similar activity",
+            "similar frequency",
+            "similar users",
+            "people like me",
+            "peers like me",
+            "similar peers",
+            "fair comparison",
+            "fair peer",
+            "not everyone",
+            "not all members",
+            "not all peers",
+        ]
+    )
+
+    if "cohort" in tl and not explicit_peer_scope_phrase and "peer_definition" not in plan.ambiguities:
+        plan.ambiguities.append("peer_definition")
+
+    # Hard negation guardrail: do not allow broad cohort when user excludes everyone/all-members.
+    if any(k in tl for k in ["not everyone", "not all members", "not all peers"]) and plan.peer_definition.scope == "all_members":
+        plan.peer_definition = deterministic_peer
+
+    # For requests that ask to focus on key metrics, narrow to two metrics by policy.
+    if any(k in tl for k in ["what matters most", "focus on what matters", "most important", "key metrics"]):
+        explicit_all_three = any(k in tl for k in ["all three", "all metrics"])
+        if not explicit_all_three and len(plan.metrics.selected) >= 3:
+            plan.metrics = MetricSelection(selected=list(PRIORITY_METRICS), inferred=deterministic_metrics_selected)
+            plan.assumptions = [
+                a for a in plan.assumptions if not a.startswith("Used default metrics:")
+            ]
+            plan.assumptions = [*plan.assumptions, "Focused on priority metrics: weekly workouts and consistency."][:5]
+
+    if deterministic_peer_ambiguous and "peer_definition" not in plan.ambiguities and "cohort" in tl:
+        plan.ambiguities.append("peer_definition")
+
+    if plan.member_id is None and "member_id" not in plan.ambiguities:
+        plan.ambiguities.append("member_id")
     if plan.member_id is None:
         plan.needs_clarification = True
         plan.requested_slot = "member_id"
-        plan.clarifying_question = "What is your member_id (for example, MB001)?"
-        if "member_id" not in plan.ambiguities:
-            plan.ambiguities.append("member_id")
+        plan.clarifying_question = _slot_question("member_id")
+
+    # Ensure ambiguity flags and clarification state are consistent.
+    if plan.ambiguities and not plan.needs_clarification:
+        plan.needs_clarification = True
+    if plan.needs_clarification:
+        plan.requested_slot = _choose_requested_slot(plan.ambiguities) or plan.requested_slot
+        if plan.requested_slot and plan.requested_slot not in plan.ambiguities:
+            plan.ambiguities.append(plan.requested_slot)
+        if not plan.clarifying_question and plan.requested_slot:
+            plan.clarifying_question = _slot_question(plan.requested_slot)
+    else:
+        plan.requested_slot = None
+        plan.clarifying_question = None
 
     start_date, end_date = _timeframe_dates(plan.timeframe)
+    uncertainty_score, uncertainty_signals = _estimate_uncertainty(
+        plan=plan,
+        user_text=user_text,
+        pending_slot=state.get("prior_pending_slot"),
+    )
     return {
         "plan": plan.model_dump(),
         "start_date": start_date,
         "end_date": end_date,
         "timeframe_label": plan.timeframe,
+        "uncertainty_score": uncertainty_score,
+        "uncertainty_signals": uncertainty_signals,
     }
 
 

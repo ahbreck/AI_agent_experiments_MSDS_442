@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import re
 import sqlite3
+from contextlib import closing
 from collections import defaultdict
 from datetime import date, timedelta
 from pathlib import Path
@@ -110,7 +111,7 @@ def _read_campaign_feedback(filters: Dict[str, Any]) -> List[Dict[str, Any]]:
     {where_sql}
     """
 
-    with sqlite3.connect(DB_PATH) as conn:
+    with closing(sqlite3.connect(DB_PATH)) as conn:
         register_sqlite_alnum_normalizer(conn)
         conn.row_factory = sqlite3.Row
         rows = [dict(r) for r in conn.execute(sql, params).fetchall()]

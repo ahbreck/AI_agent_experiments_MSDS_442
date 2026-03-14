@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sqlite3
+from contextlib import closing
 from pathlib import Path
 from typing import Dict, List, Tuple
 
@@ -42,7 +43,7 @@ def _interpretation(current: str, recommended: str, util_3mo: float, feature_lev
 
 
 def seed() -> None:
-    with sqlite3.connect(DB_PATH) as conn:
+    with closing(sqlite3.connect(DB_PATH)) as conn:
         cur = conn.cursor()
 
         cur.execute(
