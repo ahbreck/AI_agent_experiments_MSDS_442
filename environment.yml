@@ -51,3 +51,4 @@ dependencies:
       - nbstripout
       - chromadb
       - tiktoken
+      - streamlit

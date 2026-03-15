@@ -91,6 +91,18 @@ Direct run (if your `msds_442` environment is already active):
 python .\Project_Phase_3\prototype_cli.py
 ```
 
+Streamlit chatbot UI:
+
+```powershell
+python -m streamlit run .\Project_Phase_3\streamlit_app.py
+```
+
+The Streamlit app supports:
+- Persistent multi-turn chat history.
+- Configurable `thread_id` to simulate separate users/sessions.
+- Plotly rendering when `story_output.chart_spec.library == "plotly"`.
+- Optional debug metadata and raw `story_output` display.
+
 ## Run Tests
 From repo root:
 
