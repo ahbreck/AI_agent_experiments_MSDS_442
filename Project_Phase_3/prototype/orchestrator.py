@@ -11,7 +11,6 @@ try:
 except ImportError:  # optional dependency
     find_dotenv = None
     load_dotenv = None
-from langchain_openai import ChatOpenAI
 from langgraph.graph import END, StateGraph
 from langgraph.checkpoint.base import empty_checkpoint
 from langgraph.checkpoint.memory import MemorySaver
@@ -19,7 +18,7 @@ from pydantic import BaseModel, Field
 
 from .catalog import DOMAIN_TO_STORIES, STORY_CATALOG
 from .contracts import CanonicalMember, GlobalState, RouteDecision, StoryRequest, StoryResult
-from .utils import extract_explicit_member_id
+from .utils import build_chat_openai, extract_explicit_member_id, has_openai_client_config
 
 # Suppress known noisy structured-output serializer warning from dependency internals.
 warnings.filterwarnings(
@@ -102,14 +101,14 @@ class AgenticOrchestrator:
     ):
         if load_dotenv and find_dotenv:
             load_dotenv(find_dotenv())
-        if not os.getenv("OPENAI_API_KEY"):
+        if not has_openai_client_config():
             raise RuntimeError(
-                "OPENAI_API_KEY is not set. Add it to your environment or .env before initializing AgenticOrchestrator."
+                "No OpenAI client config found. Set OPENAI_API_KEY, or provide OPENAI_BASE_URL plus OPENAI_COMPATIBLE_API_KEY."
             )
         self.state = state or GlobalState()
         self.checkpointer = checkpointer or MemorySaver()
         self.checkpoint_ns = checkpoint_ns
-        self.llm = ChatOpenAI(model="gpt-4o-mini", temperature=0)
+        self.llm = build_chat_openai(model="gpt-4o-mini", temperature=0)
         self.graph = self._build_graph()
 
     def _thread_config(self, thread_id: str) -> Dict[str, Any]:

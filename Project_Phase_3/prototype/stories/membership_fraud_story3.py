@@ -5,12 +5,17 @@ from contextlib import closing
 from pathlib import Path
 from typing import Any, Dict, List, Literal, Optional, TypedDict
 
-from langchain_openai import ChatOpenAI
 from langgraph.graph import END, StateGraph
 from pydantic import BaseModel, Field
 
 from ..contracts import StoryRequest, StoryResult
-from ..utils import extract_explicit_member_id, member_id_aliases, normalize_member_id, register_sqlite_alnum_normalizer
+from ..utils import (
+    build_chat_openai,
+    extract_explicit_member_id,
+    member_id_aliases,
+    normalize_member_id,
+    register_sqlite_alnum_normalizer,
+)
 
 PROJECT_PHASE_3 = Path(__file__).resolve().parents[2]
 DB_PATH = PROJECT_PHASE_3 / "kb" / "MembershipFraud" / "membership_fraud.db"
@@ -455,7 +460,7 @@ def _evidence_planner_node(state: TierFitState) -> TierFitState:
     }
 
 
-def _evidence_planner_node_llm(state: TierFitState, llm: Optional[ChatOpenAI]) -> TierFitState:
+def _evidence_planner_node_llm(state: TierFitState, llm: Optional[Any]) -> TierFitState:
     deterministic = _evidence_planner_node(state).get("evidence_plan", {})
     if llm is None:
         deterministic["planner_source"] = "deterministic_no_llm"
@@ -615,7 +620,7 @@ def _evaluate_node(state: TierFitState) -> TierFitState:
     return {"evaluation": evaluation, "options": options}
 
 
-def _rationale_node_llm(state: TierFitState, llm: Optional[ChatOpenAI]) -> TierFitState:
+def _rationale_node_llm(state: TierFitState, llm: Optional[Any]) -> TierFitState:
     if llm is None:
         return {"llm_rationale": {"summary": "", "source": "skipped_no_llm"}}
     member_id = state.get("member_id")
@@ -782,9 +787,9 @@ def _respond_node(state: TierFitState) -> TierFitState:
 
 
 def _build_story_graph():
-    llm: Optional[ChatOpenAI] = None
+    llm: Optional[Any] = None
     try:
-        llm = ChatOpenAI(model="gpt-4o-mini", temperature=0)
+        llm = build_chat_openai(model="gpt-4o-mini", temperature=0)
     except Exception:
         llm = None
     builder = StateGraph(TierFitState)

@@ -14,7 +14,9 @@ from langgraph.graph import END, StateGraph
 from pydantic import BaseModel, Field, ValidationError
 from ..contracts import StoryRequest, StoryResult
 from ..utils import (
+    build_chat_openai,
     extract_explicit_member_id,
+    has_openai_client_config,
     normalize_member_id,
     normalize_token_alnum,
     parse_date_range_from_text,
@@ -701,12 +703,10 @@ def _maybe_llm_plan(
 ) -> Tuple[Optional[Dict[str, Any]], str, Dict[str, Any]]:
     if not _env_flag_enabled("PROTOTYPE_DS2_USE_LLM_PLAN"):
         return None, "disabled_by_env", {}
-    try:
-        from langchain_openai import ChatOpenAI
-    except Exception:
-        return None, "missing_langchain_openai", {}
+    if not has_openai_client_config():
+        return None, "missing_openai_client_config", {}
 
-    llm = ChatOpenAI(model=os.getenv("PROTOTYPE_DS2_PLAN_MODEL", "gpt-4o-mini"), temperature=0)
+    llm = build_chat_openai(model=os.getenv("PROTOTYPE_DS2_PLAN_MODEL", "gpt-4o-mini"), temperature=0)
     structured = llm.with_structured_output(AnalysisPlan)
     system = (
         f"{PLAN_SYSTEM.strip()}\n\n"
@@ -1120,13 +1120,9 @@ def _summarize_tool_results_for_prompt(tool_results: Dict[str, Any]) -> Dict[str
 
 
 def _maybe_llm_interpret_results(user_text: str, plan: Dict[str, Any], tool_results: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    if not os.getenv("OPENAI_API_KEY"):
+    if not has_openai_client_config():
         return None
     if os.getenv("PROTOTYPE_DS2_USE_LLM_INTERPRET", "1").strip().lower() not in {"1", "true", "yes"}:
-        return None
-    try:
-        from langchain_openai import ChatOpenAI
-    except Exception:
         return None
 
     compact_results = _summarize_tool_results_for_prompt(tool_results)
@@ -1143,7 +1139,7 @@ def _maybe_llm_interpret_results(user_text: str, plan: Dict[str, Any], tool_resu
         f"COMPUTED_RESULTS_SUMMARY: {json.dumps(compact_results, ensure_ascii=True)}\n"
     )
     try:
-        llm = ChatOpenAI(model=os.getenv("PROTOTYPE_DS2_INTERPRET_MODEL", "gpt-4o-mini"), temperature=0.1)
+        llm = build_chat_openai(model=os.getenv("PROTOTYPE_DS2_INTERPRET_MODEL", "gpt-4o-mini"), temperature=0.1)
         structured = llm.with_structured_output(InterpretationOutput)
         out = structured.invoke([("system", system), ("user", user)])
         if not out:
@@ -1175,15 +1171,11 @@ def _count_failed_tool_steps(tool_results: Dict[str, Any]) -> int:
 def _maybe_llm_critic_decision(state: DataScienceStoryState) -> Optional[Dict[str, Any]]:
     if not _env_flag_enabled("PROTOTYPE_DS2_USE_LLM_CRITIC"):
         return None
-    if not os.getenv("OPENAI_API_KEY"):
-        return None
-    try:
-        from langchain_openai import ChatOpenAI
-    except Exception:
+    if not has_openai_client_config():
         return None
 
     try:
-        llm = ChatOpenAI(model=os.getenv("PROTOTYPE_DS2_CRITIC_MODEL", "gpt-4o-mini"), temperature=0)
+        llm = build_chat_openai(model=os.getenv("PROTOTYPE_DS2_CRITIC_MODEL", "gpt-4o-mini"), temperature=0)
         structured = llm.with_structured_output(CriticDecisionOutput)
         compact_results = _summarize_tool_results_for_prompt(state.get("tool_results", {}))
         critic_input = {

@@ -13,7 +13,9 @@ from typing import Any, Dict, List, Optional, Tuple, TypedDict
 from langgraph.graph import END, StateGraph
 from ..contracts import StoryRequest, StoryResult
 from ..utils import (
+    build_chat_openai,
     extract_explicit_member_id,
+    has_openai_client_config,
     normalize_member_id,
     parse_date_range_from_text,
     register_sqlite_alnum_normalizer,
@@ -199,14 +201,10 @@ def _deterministic_refinement_assessment(user_text: str) -> Dict[str, Any]:
 
 
 def _maybe_llm_refinement_assessment(user_text: str, prior_plan: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    if not os.getenv("OPENAI_API_KEY"):
-        return None
-    try:
-        from langchain_openai import ChatOpenAI  # type: ignore
-    except Exception:
+    if not has_openai_client_config():
         return None
 
-    model = ChatOpenAI(model="gpt-4o-mini", temperature=0)
+    model = build_chat_openai(model="gpt-4o-mini", temperature=0)
     system = (
         "You classify whether the user's latest message is a refinement/edit request about a previously shown chart.\n"
         "Return JSON only with keys: is_refinement (bool), confidence (0..1), rationale (string).\n"

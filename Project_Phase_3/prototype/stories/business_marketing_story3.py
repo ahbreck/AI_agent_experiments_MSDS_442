@@ -7,7 +7,6 @@ from datetime import date
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple, TypedDict
 
-from langchain_openai import ChatOpenAI
 try:
     from langchain_core.runnables.graph import MermaidDrawMethod
 except Exception:  # pragma: no cover - backward compatibility for older langchain-core
@@ -16,6 +15,7 @@ from langgraph.graph import END, StateGraph
 from pydantic import BaseModel, Field
 
 from ..contracts import StoryRequest, StoryResult
+from ..utils import build_chat_openai
 
 PROJECT_PHASE_3 = Path(__file__).resolve().parents[2]
 DB_PATH = PROJECT_PHASE_3 / "kb" / "BusinessMarketing" / "brand_feedback.db"
@@ -343,7 +343,7 @@ def _llm_request_plan(user_text: str) -> Optional[LeadPlanningOutput]:
     )
     user = f"USER_QUERY: {user_text}"
     try:
-        llm = ChatOpenAI(model="gpt-4o-mini", temperature=0)
+        llm = build_chat_openai(model="gpt-4o-mini", temperature=0)
         structured = llm.with_structured_output(LeadPlanningOutput)
         return structured.invoke([("system", system), ("user", user)])
     except Exception:

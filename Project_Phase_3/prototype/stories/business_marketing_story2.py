@@ -9,7 +9,6 @@ from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict, List, Literal, Optional, Sequence, Tuple, TypedDict
 
-from langchain_openai import ChatOpenAI
 try:
     from langchain_core.runnables.graph import MermaidDrawMethod
 except Exception:  # pragma: no cover - backward compatibility for older langchain-core
@@ -17,7 +16,7 @@ except Exception:  # pragma: no cover - backward compatibility for older langcha
 from langgraph.graph import END, StateGraph
 from pydantic import BaseModel, Field
 from ..contracts import StoryRequest, StoryResult
-from ..utils import normalize_campaign_id, register_sqlite_alnum_normalizer
+from ..utils import build_chat_openai, normalize_campaign_id, register_sqlite_alnum_normalizer
 
 PROJECT_PHASE_3 = Path(__file__).resolve().parents[2]
 DB_PATH = PROJECT_PHASE_3 / "kb" / "BusinessMarketing" / "brand_feedback.db"
@@ -287,7 +286,7 @@ def _classify_intent(user_text: str) -> Dict[str, Any]:
     )
     user = f"USER_QUERY: {user_text}"
     try:
-        llm = ChatOpenAI(model="gpt-4o-mini", temperature=0)
+        llm = build_chat_openai(model="gpt-4o-mini", temperature=0)
         structured = llm.with_structured_output(IntentClassifierOutput)
         out = structured.invoke([("system", system), ("user", user)])
         llm_choice = out.intent if out.intent in INTENT_TYPES else base["intent"]
@@ -1029,7 +1028,7 @@ def _maybe_llm_scope_plan(state: Story2GraphState) -> Optional[Dict[str, Any]]:
         "filters": state.get("filters", {}),
     }
     try:
-        llm = ChatOpenAI(model=os.getenv("PROTOTYPE_BM2_PLAN_MODEL", "gpt-4o-mini"), temperature=0)
+        llm = build_chat_openai(model=os.getenv("PROTOTYPE_BM2_PLAN_MODEL", "gpt-4o-mini"), temperature=0)
         structured = llm.with_structured_output(ScopePlannerOutput)
         system = (
             "You are a planning assistant for weekly marketing KPI analysis.\n"
@@ -1091,7 +1090,7 @@ def _plan_with_llm_node(state: Story2GraphState) -> Story2GraphState:
 
 def _maybe_llm_critic_decision(state: Story2GraphState) -> Optional[Dict[str, Any]]:
     try:
-        llm = ChatOpenAI(model=os.getenv("PROTOTYPE_BM2_CRITIC_MODEL", "gpt-4o-mini"), temperature=0)
+        llm = build_chat_openai(model=os.getenv("PROTOTYPE_BM2_CRITIC_MODEL", "gpt-4o-mini"), temperature=0)
         structured = llm.with_structured_output(CriticDecisionOutput)
         summary_rows = ((state.get("summary") or {}).get("rows") or [])[:3]
         quality = state.get("quality", {})
@@ -1340,7 +1339,7 @@ def _threshold_eval_node(state: Story2GraphState) -> Story2GraphState:
 
 def _maybe_generate_grounded_narrative(payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     try:
-        llm = ChatOpenAI(model="gpt-4o-mini", temperature=0)
+        llm = build_chat_openai(model="gpt-4o-mini", temperature=0)
         structured = llm.with_structured_output(GroundedNarrativeOutput)
         facts = {
             "intent": payload.get("intent"),

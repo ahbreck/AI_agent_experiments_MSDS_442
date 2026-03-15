@@ -8,12 +8,13 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict, List, Literal, Optional, TypedDict
 
-from langchain_openai import ChatOpenAI
 from langgraph.graph import END, StateGraph
 from pydantic import BaseModel, Field
 
 from ..contracts import StoryRequest, StoryResult
 from ..utils import (
+    build_chat_openai,
+    build_openai_embeddings,
     extract_explicit_member_id,
     member_id_aliases,
     normalize_member_id,
@@ -206,7 +207,6 @@ def _get_security_help_store():
 
     try:
         from langchain_chroma import Chroma
-        from langchain_openai import OpenAIEmbeddings
     except Exception:
         return None
 
@@ -214,7 +214,7 @@ def _get_security_help_store():
         SECURITY_HELP_STORE = Chroma(
             collection_name=SECURITY_HELP_COLLECTION,
             persist_directory=str(SECURITY_HELP_CHROMA_DIR),
-            embedding_function=OpenAIEmbeddings(model="text-embedding-3-small"),
+            embedding_function=build_openai_embeddings(model="text-embedding-3-small"),
         )
     except Exception:
         SECURITY_HELP_STORE = None
@@ -272,7 +272,7 @@ def _retrieve_security_help(query: str, k: int = 3) -> List[Dict[str, Any]]:
     return scored[:k]
 
 
-def _answer_security_howto(user_text: str, llm: ChatOpenAI) -> Optional[Dict[str, Any]]:
+def _answer_security_howto(user_text: str, llm: Any) -> Optional[Dict[str, Any]]:
     snippets = _retrieve_security_help(user_text, k=3)
     if not snippets:
         return None
@@ -365,7 +365,7 @@ def _guide_security_actions(event: Dict[str, Any]) -> List[str]:
     return base + ["No urgent action is needed if you recognize the login context."]
 
 
-def _planner_node(state: SecurityState, llm: ChatOpenAI) -> SecurityState:
+def _planner_node(state: SecurityState, llm: Any) -> SecurityState:
     user_text = state.get("user_text", "")
     existing_member_id = state.get("member_id")
     existing_timeframe = state.get("timeframe")
@@ -456,7 +456,7 @@ def _retrieve_node(state: SecurityState) -> SecurityState:
     }
 
 
-def _respond_node(state: SecurityState, llm: ChatOpenAI) -> SecurityState:
+def _respond_node(state: SecurityState, llm: Any) -> SecurityState:
     intent_route = str(state.get("intent_route") or "event_only")
     user_text = state.get("user_text", "")
 
@@ -632,7 +632,7 @@ def _self_check_node(state: SecurityState) -> SecurityState:
 
 
 def _build_story_graph():
-    llm = ChatOpenAI(model="gpt-4o-mini", temperature=0)
+    llm = build_chat_openai(model="gpt-4o-mini", temperature=0)
     builder = StateGraph(SecurityState)
 
     def plan_node(state: SecurityState) -> SecurityState:

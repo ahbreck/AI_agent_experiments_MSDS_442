@@ -8,12 +8,12 @@ from datetime import date, timedelta
 from pathlib import Path
 from typing import Any, Dict, List, Optional, TypedDict
 
-from langchain_openai import ChatOpenAI
 from langgraph.graph import END, StateGraph
 from pydantic import BaseModel, Field
 
 from ..contracts import StoryRequest, StoryResult
 from ..utils import (
+    build_chat_openai,
     extract_explicit_member_id,
     normalize_campaign_id,
     parse_last_n_weeks,
@@ -365,7 +365,7 @@ def _rescope_node(state: FeedbackGraphState) -> FeedbackGraphState:
     }
 
 
-def _recommend_node(state: FeedbackGraphState, llm: ChatOpenAI) -> FeedbackGraphState:
+def _recommend_node(state: FeedbackGraphState, llm: Any) -> FeedbackGraphState:
     themes = state.get("aggregation", {}).get("themes", [])
     if not themes:
         return {"adjustments": []}
@@ -590,7 +590,7 @@ def _format_node(state: FeedbackGraphState) -> FeedbackGraphState:
 
 
 def _build_story_graph():
-    llm = ChatOpenAI(model="gpt-4o-mini", temperature=0)
+    llm = build_chat_openai(model="gpt-4o-mini", temperature=0)
     g = StateGraph(FeedbackGraphState)
 
     def recommend_node(state: FeedbackGraphState) -> FeedbackGraphState:

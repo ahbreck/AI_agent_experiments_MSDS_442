@@ -1,9 +1,10 @@
 from __future__ import annotations
 
+import os
 import re
 import sqlite3
 from datetime import date, timedelta
-from typing import Any, Callable, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 
 def normalize_token_alnum(raw: Optional[str]) -> Optional[str]:
@@ -11,6 +12,40 @@ def normalize_token_alnum(raw: Optional[str]) -> Optional[str]:
         return None
     token = re.sub(r"[^A-Z0-9]", "", raw.strip().upper())
     return token or None
+
+
+def resolve_openai_client_config() -> Dict[str, str]:
+    api_key = os.getenv("OPENAI_API_KEY") or os.getenv("OPENAI_COMPATIBLE_API_KEY")
+    base_url = (
+        os.getenv("OPENAI_BASE_URL")
+        or os.getenv("OPENAI_API_BASE")
+        or os.getenv("OPENAI_COMPATIBLE_BASE_URL")
+    )
+
+    config: Dict[str, str] = {}
+    if base_url:
+        config["base_url"] = base_url
+    if api_key:
+        config["api_key"] = api_key
+    elif base_url:
+        config["api_key"] = os.getenv("OPENAI_COMPATIBLE_DUMMY_API_KEY", "not-needed")
+    return config
+
+
+def has_openai_client_config() -> bool:
+    return bool(resolve_openai_client_config())
+
+
+def build_chat_openai(*, model: str, temperature: float = 0, **kwargs: Any):
+    from langchain_openai import ChatOpenAI
+
+    return ChatOpenAI(model=model, temperature=temperature, **resolve_openai_client_config(), **kwargs)
+
+
+def build_openai_embeddings(*, model: str = "text-embedding-3-small", **kwargs: Any):
+    from langchain_openai import OpenAIEmbeddings
+
+    return OpenAIEmbeddings(model=model, **resolve_openai_client_config(), **kwargs)
 
 
 def normalize_id(raw: Optional[str]) -> Optional[str]:

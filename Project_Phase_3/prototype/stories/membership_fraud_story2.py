@@ -5,11 +5,11 @@ import re
 from pathlib import Path
 from typing import Any, Dict, List, Literal, TypedDict
 
-from langchain_openai import ChatOpenAI
 from langgraph.graph import END, StateGraph
 from pydantic import BaseModel, Field
 
 from ..contracts import StoryRequest, StoryResult
+from ..utils import build_chat_openai, build_openai_embeddings
 
 IssueCategory = Literal["login", "billing", "renewal", "unknown"]
 
@@ -163,7 +163,6 @@ def _get_category_help_store(category: str):
 
     try:
         from langchain_chroma import Chroma
-        from langchain_openai import OpenAIEmbeddings
     except Exception:
         HELP_STORE[category] = None
         return None
@@ -172,7 +171,7 @@ def _get_category_help_store(category: str):
         HELP_STORE[category] = Chroma(
             collection_name=collection,
             persist_directory=str(chroma_dir),
-            embedding_function=OpenAIEmbeddings(model="text-embedding-3-small"),
+            embedding_function=build_openai_embeddings(model="text-embedding-3-small"),
         )
     except Exception:
         HELP_STORE[category] = None
@@ -299,7 +298,7 @@ def _resolve_issue_with_llm(user_text: str, base: Dict[str, Any]) -> Dict[str, A
         f"DETERMINISTIC_BASE_SCORES: {base.get('category_scores')}"
     )
     try:
-        llm = ChatOpenAI(model="gpt-4o-mini", temperature=0)
+        llm = build_chat_openai(model="gpt-4o-mini", temperature=0)
         structured = llm.with_structured_output(IssueClassifierOutput)
         out = structured.invoke([("system", system), ("user", user)])
         candidate = out.issue_category if out.issue_category in ISSUE_CATEGORIES else "unknown"

@@ -13,7 +13,12 @@ from langgraph.graph import END, StateGraph
 from pydantic import BaseModel, Field, ValidationError
 
 from ..contracts import StoryRequest, StoryResult
-from ..utils import extract_explicit_member_id, normalize_member_id, register_sqlite_alnum_normalizer
+from ..utils import (
+    build_chat_openai,
+    extract_explicit_member_id,
+    normalize_member_id,
+    register_sqlite_alnum_normalizer,
+)
 
 PROJECT_PHASE_3 = Path(__file__).resolve().parents[2]
 DB_PATH = PROJECT_PHASE_3 / "kb" / "DataScience" / "peloton_workouts.sqlite"
@@ -325,10 +330,6 @@ def _deterministic_plan(user_text: str, fallback_member: Optional[str]) -> PlanO
 def _maybe_llm_plan(user_text: str, fallback_member: Optional[str]) -> Optional[PlanOutput]:
     if os.getenv("PROTOTYPE_DS3_USE_LLM_PLAN", "0").strip() not in {"1", "true", "TRUE"}:
         return None
-    try:
-        from langchain_openai import ChatOpenAI
-    except Exception:
-        return None
 
     system = (
         "You are planning a peer-benchmark workout comparison request. "
@@ -344,7 +345,7 @@ def _maybe_llm_plan(user_text: str, fallback_member: Optional[str]) -> Optional[
     )
 
     try:
-        llm = ChatOpenAI(model=os.getenv("PROTOTYPE_DS3_PLAN_MODEL", "gpt-4o-mini"), temperature=0)
+        llm = build_chat_openai(model=os.getenv("PROTOTYPE_DS3_PLAN_MODEL", "gpt-4o-mini"), temperature=0)
         structured = llm.with_structured_output(PlanOutput)
         out = structured.invoke([("system", system), ("user", user)])
         return out
